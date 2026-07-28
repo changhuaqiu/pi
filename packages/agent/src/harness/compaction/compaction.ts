@@ -114,6 +114,14 @@ export interface CompactionResult<T = unknown> {
 	details?: T;
 }
 
+export interface CompactionProgress {
+	phase: "summarizing" | "turn_prefix" | "finalizing";
+	/** Accumulated summary text produced so far. */
+	text: string;
+}
+
+export type CompactionProgressCallback = (progress: CompactionProgress) => Promise<void> | void;
+
 export async function completeSimpleWithRetries(
 	models: Models,
 	model: Model<any>,
@@ -121,8 +129,25 @@ export async function completeSimpleWithRetries(
 	options: SimpleStreamOptions,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	onText?: (text: string) => Promise<void> | void,
 ): Promise<AssistantMessage> {
-	return retryAssistantCall(() => models.completeSimple(model, context, options), retry, options.signal, callbacks);
+	return retryAssistantCall(
+		async () => {
+			if (!onText) return await models.completeSimple(model, context, options);
+			let text = "";
+			await onText(text);
+			const stream = models.streamSimple(model, context, options);
+			for await (const event of stream) {
+				if (event.type !== "text_delta") continue;
+				text += event.delta;
+				await onText(text);
+			}
+			return await stream.result();
+		},
+		retry,
+		options.signal,
+		callbacks,
+	);
 }
 
 function combineUsage(first: Usage, second: Usage): Usage {
@@ -209,7 +234,15 @@ export interface ContextUsageEstimate {
 }
 
 function getLastAssistantUsageInfo(messages: AgentMessage[]): { usage: Usage; index: number } | undefined {
+	let minimumUsageIndex = 0;
 	for (let i = messages.length - 1; i >= 0; i--) {
+		const message = messages[i];
+		if (message.role !== "compactionSummary") continue;
+		if (message.retainedMessageCount === undefined) return undefined;
+		minimumUsageIndex = i + message.retainedMessageCount + 1;
+		break;
+	}
+	for (let i = messages.length - 1; i >= minimumUsageIndex; i--) {
 		const usage = getAssistantUsage(messages[i]);
 		if (usage) return { usage, index: i };
 	}
@@ -519,6 +552,7 @@ export async function generateSummary(
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	onText?: (text: string) => Promise<void> | void,
 ): Promise<Result<string, CompactionError>> {
 	const result = await generateSummaryWithUsage(
 		currentMessages,
@@ -531,6 +565,7 @@ export async function generateSummary(
 		thinkingLevel,
 		retry,
 		callbacks,
+		onText,
 	);
 	return result.ok ? ok(result.value.text) : err(result.error);
 }
@@ -547,6 +582,7 @@ export async function generateSummaryWithUsage(
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	onText?: (text: string) => Promise<void> | void,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.8 * reserveTokens),
@@ -584,6 +620,7 @@ export async function generateSummaryWithUsage(
 		completionOptions,
 		retry,
 		callbacks,
+		onText,
 	);
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Summarization aborted"));
@@ -727,6 +764,7 @@ export async function compact(
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	onProgress?: CompactionProgressCallback,
 ): Promise<Result<CompactionResult, CompactionError>> {
 	const {
 		firstKeptEntryId,
@@ -762,6 +800,7 @@ export async function compact(
 				thinkingLevel,
 				retry,
 				callbacks,
+				async (text) => await onProgress?.({ phase: "summarizing", text }),
 			);
 			if (!historyResult.ok) return err(historyResult.error);
 			historyText = historyResult.value.text;
@@ -776,6 +815,11 @@ export async function compact(
 			thinkingLevel,
 			retry,
 			callbacks,
+			async (text) =>
+				await onProgress?.({
+					phase: "turn_prefix",
+					text: `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${text}`,
+				}),
 		);
 		if (!turnPrefixResult.ok) return err(turnPrefixResult.error);
 		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.value.text}`;
@@ -794,6 +838,7 @@ export async function compact(
 			thinkingLevel,
 			retry,
 			callbacks,
+			async (text) => await onProgress?.({ phase: "summarizing", text }),
 		);
 		if (!summaryResult.ok) return err(summaryResult.error);
 		summary = summaryResult.value.text;
@@ -802,6 +847,7 @@ export async function compact(
 
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
+	await onProgress?.({ phase: "finalizing", text: summary });
 
 	return ok({
 		summary,
@@ -821,6 +867,7 @@ async function generateTurnPrefixSummary(
 	thinkingLevel?: ThinkingLevel,
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
+	onText?: (text: string) => Promise<void> | void,
 ): Promise<Result<{ text: string; usage: Usage }, CompactionError>> {
 	const maxTokens = Math.min(
 		Math.floor(0.5 * reserveTokens),
@@ -848,6 +895,7 @@ async function generateTurnPrefixSummary(
 		completionOptions,
 		retry,
 		callbacks,
+		onText,
 	);
 	if (response.stopReason === "aborted") {
 		return err(new CompactionError("aborted", response.errorMessage || "Turn prefix summarization aborted"));

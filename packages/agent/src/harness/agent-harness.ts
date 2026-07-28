@@ -26,6 +26,7 @@ import { formatPromptTemplateInvocation } from "./prompt-templates.ts";
 import { formatSkillInvocation } from "./skills.ts";
 import type {
 	AbortResult,
+	AgentHarnessCompactOptions,
 	AgentHarnessEvent,
 	AgentHarnessEventResultMap,
 	AgentHarnessOptions,
@@ -711,10 +712,12 @@ export class AgentHarness<
 		}
 	}
 
-	async compact(customInstructions?: string): Promise<CompactResult> {
+	async compact(customInstructions?: string, options: AgentHarnessCompactOptions = {}): Promise<CompactResult> {
 		if (this.phase !== "idle") throw new AgentHarnessError("busy", "compact() requires idle harness");
 		this.phase = "compaction";
 		try {
+			const signal = options.signal ?? new AbortController().signal;
+			if (signal.aborted) throw new CompactionError("aborted", "Compaction aborted");
 			const model = this.model;
 			if (!model) throw new AgentHarnessError("invalid_state", "No model set for compaction");
 			const branchEntries = await this.session.getBranch();
@@ -727,7 +730,7 @@ export class AgentHarness<
 				preparation,
 				branchEntries,
 				customInstructions,
-				signal: new AbortController().signal,
+				signal,
 			});
 			if (hookResult?.cancel) throw new AgentHarnessError("compaction", "Compaction cancelled");
 			const provided = hookResult?.compaction;
@@ -738,13 +741,16 @@ export class AgentHarness<
 						this.models,
 						model,
 						customInstructions,
-						undefined,
+						signal,
 						this.thinkingLevel,
 						this.retry,
 						this.retryCallbacks("compaction"),
+						(progress) => this.emitOwn({ type: "compaction_update", ...progress }, signal),
 					);
 			if (!compactResult.ok) throw compactResult.error;
 			const result = compactResult.value;
+			if (signal.aborted) throw new CompactionError("aborted", "Compaction aborted");
+			await this.emitOwn({ type: "compaction_update", phase: "committing", text: result.summary }, signal);
 			const entryId = await this.session.appendCompaction(
 				result.summary,
 				result.firstKeptEntryId,

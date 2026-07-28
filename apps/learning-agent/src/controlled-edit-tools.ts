@@ -1,0 +1,534 @@
+import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { chmod, lstat, open, realpath, rename, rm } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import { type Static, Type } from "typebox";
+import { Compile } from "typebox/compile";
+import { normalizeRelativePath } from "./read-only-tools.ts";
+
+export type ControlledEditToolName = "propose_patch" | "apply_edit";
+
+export interface EditProposalSummary {
+	id: string;
+	path: string;
+	description?: string;
+	diff: string;
+	expectedHash: string;
+	expiresAt: string;
+}
+
+export interface AppliedEdit {
+	proposalId: string;
+	path: string;
+	previousHash: string;
+	newHash: string;
+}
+
+export interface EditableFileSnapshot {
+	path: string;
+	resolvedPath: string;
+	content: string;
+	hash: string;
+	mode: number;
+}
+
+export interface ControlledEditOperations {
+	readEditableFile(path: string, signal?: AbortSignal): Promise<EditableFileSnapshot>;
+	/**
+	 * Coordinates Learning Agent writers with an adjacent lock, rechecks the
+	 * snapshot immediately before commit, and atomically renames the new file.
+	 * External processes that ignore the lock can still race the final recheck.
+	 */
+	replaceIfUnchanged(
+		snapshot: EditableFileSnapshot,
+		newContent: string,
+		signal?: AbortSignal,
+	): Promise<{ previousHash: string; newHash: string }>;
+}
+
+export interface ControlledEditManager {
+	propose(
+		input: { path: string; oldText: string; newText: string; description?: string },
+		signal?: AbortSignal,
+	): Promise<EditProposalSummary>;
+	getProposal(id: string): EditProposalSummary;
+	approve(id: string): void;
+	apply(id: string, signal?: AbortSignal): Promise<AppliedEdit>;
+}
+
+export interface ControlledEditToolDetails {
+	stage: "validating" | "preparing" | "awaiting_approval" | "applying" | "completed";
+	path?: string;
+	proposalId?: string;
+	previousHash?: string;
+	newHash?: string;
+}
+
+const proposePatchSchema = Type.Object(
+	{
+		path: Type.String({
+			description: "Existing file under apps/learning-agent, relative to the workspace root",
+			minLength: 1,
+			maxLength: 500,
+		}),
+		oldText: Type.String({
+			description: "Exact non-empty text currently present exactly once in the target file",
+			minLength: 1,
+			maxLength: 32 * 1024,
+		}),
+		newText: Type.String({
+			description: "Replacement text. Use an empty string to delete oldText",
+			maxLength: 32 * 1024,
+		}),
+		description: Type.Optional(
+			Type.String({ description: "Short reason for the edit", minLength: 1, maxLength: 500 }),
+		),
+	},
+	{ additionalProperties: false },
+);
+
+const applyEditSchema = Type.Object(
+	{
+		proposalId: Type.String({
+			description: "Identifier returned by propose_patch",
+			minLength: 1,
+			maxLength: 100,
+		}),
+	},
+	{ additionalProperties: false },
+);
+
+type ProposePatchInput = Static<typeof proposePatchSchema>;
+type ApplyEditInput = Static<typeof applyEditSchema>;
+
+interface StoredProposal {
+	summary: EditProposalSummary;
+	snapshot: EditableFileSnapshot;
+	newContent: string;
+	status: "pending" | "approved" | "applying" | "applied";
+}
+
+const proposePatchValidator = Compile(proposePatchSchema);
+const applyEditValidator = Compile(applyEditSchema);
+const editablePathPrefix = "apps/learning-agent/";
+const maxEditableFileBytes = 512 * 1024;
+const maxReplacementBytes = 64 * 1024;
+const maxStoredProposals = 20;
+const proposalTtlMs = 15 * 60 * 1000;
+
+function throwIfAborted(signal?: AbortSignal): void {
+	if (!signal?.aborted) return;
+	const error = new Error("Operation aborted");
+	error.name = "AbortError";
+	throw error;
+}
+
+function hashText(content: string): string {
+	return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function isWithinRoot(root: string, target: string): boolean {
+	const pathFromRoot = relative(root, target);
+	return (
+		pathFromRoot === "" ||
+		(pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot))
+	);
+}
+
+function normalizeEditablePath(path: string): string {
+	const normalized = normalizeRelativePath(path);
+	if (!normalized.toLowerCase().startsWith(editablePathPrefix)) {
+		throw new Error(`Edits are limited to ${editablePathPrefix}**`);
+	}
+	if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(normalized)) {
+		throw new Error("Editable paths cannot contain Unicode control or formatting characters");
+	}
+	return normalized;
+}
+
+async function readTextFile(path: string, signal?: AbortSignal): Promise<{ content: string; mode: number }> {
+	throwIfAborted(signal);
+	const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+	try {
+		throwIfAborted(signal);
+		const stats = await handle.stat();
+		throwIfAborted(signal);
+		if (!stats.isFile()) throw new Error("Editable path is not a file");
+		if (stats.size > maxEditableFileBytes) {
+			throw new Error(`Editable file exceeds ${maxEditableFileBytes} bytes`);
+		}
+		const buffer = Buffer.alloc(stats.size);
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+		throwIfAborted(signal);
+		const content = buffer.subarray(0, bytesRead);
+		if (content.includes(0)) throw new Error("Binary files are not editable");
+		return { content: content.toString("utf8"), mode: stats.mode };
+	} finally {
+		await handle.close();
+	}
+}
+
+export function createNodeControlledEditOperations(workspaceRoot: string): ControlledEditOperations {
+	return {
+		async readEditableFile(path, signal) {
+			throwIfAborted(signal);
+			const normalized = normalizeEditablePath(path);
+			const lexicalWorkspace = resolve(workspaceRoot);
+			const lexicalEditableRoot = resolve(lexicalWorkspace, "apps", "learning-agent");
+			const lexicalTarget = resolve(lexicalWorkspace, normalized);
+			if (!isWithinRoot(lexicalEditableRoot, lexicalTarget)) {
+				throw new Error("Editable path escapes apps/learning-agent");
+			}
+			const targetStats = await lstat(lexicalTarget);
+			throwIfAborted(signal);
+			if (targetStats.isSymbolicLink()) throw new Error("Symbolic links are not editable");
+			const resolvedEditableRoot = await realpath(lexicalEditableRoot);
+			throwIfAborted(signal);
+			const resolvedTarget = await realpath(lexicalTarget);
+			throwIfAborted(signal);
+			if (!isWithinRoot(resolvedEditableRoot, resolvedTarget)) {
+				throw new Error("Resolved editable path escapes apps/learning-agent");
+			}
+			const file = await readTextFile(resolvedTarget, signal);
+			return {
+				path: normalized,
+				resolvedPath: resolvedTarget,
+				content: file.content,
+				hash: hashText(file.content),
+				mode: file.mode,
+			};
+		},
+
+		async replaceIfUnchanged(snapshot, newContent, signal) {
+			throwIfAborted(signal);
+			const lockId = createHash("sha256").update(snapshot.resolvedPath).digest("hex").slice(0, 16);
+			const lockPath = join(dirname(snapshot.resolvedPath), `.learning-agent-edit-${lockId}.lock`);
+			let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
+			try {
+				lockHandle = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+				await lockHandle.writeFile(
+					JSON.stringify({ pid: process.pid, proposalHash: snapshot.hash, createdAt: new Date().toISOString() }),
+					"utf8",
+				);
+				await lockHandle.sync();
+			} catch (error) {
+				try {
+					await lockHandle?.close();
+				} finally {
+					if (lockHandle) await rm(lockPath, { force: true });
+				}
+				if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+					throw new Error("Another Learning Agent edit holds the target lock");
+				}
+				throw error;
+			}
+
+			try {
+				const current = await this.readEditableFile(snapshot.path, signal);
+				if (current.resolvedPath !== snapshot.resolvedPath || current.hash !== snapshot.hash) {
+					throw new Error("Edit proposal is stale because the target file changed");
+				}
+				if (Buffer.byteLength(newContent, "utf8") > maxEditableFileBytes) {
+					throw new Error(`Edited file exceeds ${maxEditableFileBytes} bytes`);
+				}
+
+				const temporaryPath = join(dirname(current.resolvedPath), `.learning-agent-edit-${randomUUID()}.tmp`);
+				let temporaryCreated = false;
+				try {
+					const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+					temporaryCreated = true;
+					try {
+						await handle.writeFile(newContent, "utf8");
+						await handle.sync();
+					} finally {
+						await handle.close();
+					}
+					await chmod(temporaryPath, current.mode);
+					throwIfAborted(signal);
+					const rechecked = await this.readEditableFile(snapshot.path, signal);
+					if (rechecked.resolvedPath !== snapshot.resolvedPath || rechecked.hash !== snapshot.hash) {
+						throw new Error("Edit proposal became stale before commit");
+					}
+					throwIfAborted(signal);
+					await rename(temporaryPath, current.resolvedPath);
+					temporaryCreated = false;
+					return { previousHash: snapshot.hash, newHash: hashText(newContent) };
+				} finally {
+					if (temporaryCreated) await rm(temporaryPath, { force: true });
+				}
+			} finally {
+				try {
+					await lockHandle.close();
+				} finally {
+					await rm(lockPath, { force: true });
+				}
+			}
+		},
+	};
+}
+
+function countOccurrences(content: string, search: string): number {
+	let count = 0;
+	let offset = 0;
+	while (offset <= content.length - search.length) {
+		const index = content.indexOf(search, offset);
+		if (index === -1) break;
+		count += 1;
+		offset = index + search.length;
+	}
+	return count;
+}
+
+function diffLineCount(text: string): number {
+	if (text.length === 0) return 0;
+	const count = text.split("\n").length;
+	return text.endsWith("\n") ? count - 1 : count;
+}
+
+function diffLines(text: string): string[] {
+	if (text.length === 0) return [];
+	const lines = text.split("\n");
+	if (text.endsWith("\n")) lines.pop();
+	return lines;
+}
+
+function createDiff(path: string, content: string, oldText: string, newText: string): string {
+	const index = content.indexOf(oldText);
+	const segmentStart = index === 0 ? 0 : content.lastIndexOf("\n", index - 1) + 1;
+	const nextLineBreak = content.indexOf("\n", index + oldText.length);
+	const segmentEnd = nextLineBreak === -1 ? content.length : nextLineBreak + 1;
+	const oldSegment = content.slice(segmentStart, segmentEnd);
+	const replacementOffset = index - segmentStart;
+	const newSegment =
+		oldSegment.slice(0, replacementOffset) +
+		newText +
+		oldSegment.slice(replacementOffset + oldText.length);
+	const startLine = content.slice(0, segmentStart).split("\n").length;
+	const oldCount = diffLineCount(oldSegment);
+	const newCount = diffLineCount(newSegment);
+	return [
+		`--- a/${path}`,
+		`+++ b/${path}`,
+		`@@ -${startLine},${oldCount} +${startLine},${newCount} @@`,
+		...diffLines(oldSegment).map((line) => `-${line}`),
+		...diffLines(newSegment).map((line) => `+${line}`),
+	].join("\n");
+}
+
+function sanitizeDescription(description: string | undefined): string | undefined {
+	const sanitized = description
+		?.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ")
+		.trim();
+	return sanitized || undefined;
+}
+
+function sanitizeDiffForDisplay(diff: string): string {
+	return diff.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) => {
+		if (character === "\n" || character === "\t") return character;
+		const codePoint = character.codePointAt(0);
+		if (codePoint === undefined) return "";
+		return codePoint <= 0xffff
+			? `\\u${codePoint.toString(16).padStart(4, "0")}`
+			: `\\u{${codePoint.toString(16)}}`;
+	});
+}
+
+export function createControlledEditManager(options: {
+	operations: ControlledEditOperations;
+	createId?: () => string;
+	now?: () => Date;
+}): ControlledEditManager {
+	const proposals = new Map<string, StoredProposal>();
+	const createId = options.createId ?? randomUUID;
+	const now = options.now ?? (() => new Date());
+
+	const getStored = (id: string): StoredProposal => {
+		const proposal = proposals.get(id);
+		if (!proposal) throw new Error(`Unknown edit proposal: ${id}`);
+		if (new Date(proposal.summary.expiresAt).getTime() <= now().getTime()) {
+			proposals.delete(id);
+			throw new Error(`Edit proposal expired: ${id}`);
+		}
+		return proposal;
+	};
+
+	return {
+		async propose(input, signal) {
+			throwIfAborted(signal);
+			if (Buffer.byteLength(input.oldText, "utf8") + Buffer.byteLength(input.newText, "utf8") > maxReplacementBytes) {
+				throw new Error(`Combined replacement exceeds ${maxReplacementBytes} bytes`);
+			}
+			if (input.oldText === input.newText) throw new Error("oldText and newText must differ");
+			const snapshot = await options.operations.readEditableFile(input.path, signal);
+			throwIfAborted(signal);
+			const occurrences = countOccurrences(snapshot.content, input.oldText);
+			if (occurrences !== 1) {
+				throw new Error(`oldText must occur exactly once in ${snapshot.path}; found ${occurrences}`);
+			}
+			const newContent = snapshot.content.replace(input.oldText, input.newText);
+			if (Buffer.byteLength(newContent, "utf8") > maxEditableFileBytes) {
+				throw new Error(`Edited file exceeds ${maxEditableFileBytes} bytes`);
+			}
+			while (proposals.size >= maxStoredProposals) {
+				const oldest = proposals.keys().next().value;
+				if (oldest === undefined) break;
+				proposals.delete(oldest);
+			}
+			const id = createId();
+			const summary: EditProposalSummary = {
+				id,
+				path: snapshot.path,
+				description: sanitizeDescription(input.description),
+				diff: sanitizeDiffForDisplay(createDiff(snapshot.path, snapshot.content, input.oldText, input.newText)),
+				expectedHash: snapshot.hash,
+				expiresAt: new Date(now().getTime() + proposalTtlMs).toISOString(),
+			};
+			proposals.set(id, { summary, snapshot, newContent, status: "pending" });
+			return { ...summary };
+		},
+
+		getProposal(id) {
+			return { ...getStored(id).summary };
+		},
+
+		approve(id) {
+			const proposal = getStored(id);
+			if (proposal.status === "approved") return;
+			if (proposal.status !== "pending") {
+				throw new Error(`Edit proposal is not pending: ${id}`);
+			}
+			proposal.status = "approved";
+		},
+
+		async apply(id, signal) {
+			const proposal = getStored(id);
+			if (proposal.status !== "approved") {
+				throw new Error(`Edit proposal has not been approved: ${id}`);
+			}
+			proposal.status = "applying";
+			try {
+				const result = await options.operations.replaceIfUnchanged(
+					proposal.snapshot,
+					proposal.newContent,
+					signal,
+				);
+				proposal.status = "applied";
+				return {
+					proposalId: id,
+					path: proposal.summary.path,
+					previousHash: result.previousHash,
+					newHash: result.newHash,
+				};
+			} catch (error) {
+				proposals.delete(id);
+				throw error;
+			}
+		},
+	};
+}
+
+function emitUpdate(
+	toolName: ControlledEditToolName,
+	onUpdate: AgentToolUpdateCallback<ControlledEditToolDetails> | undefined,
+	details: ControlledEditToolDetails,
+	signal?: AbortSignal,
+): void {
+	throwIfAborted(signal);
+	onUpdate?.({ content: [{ type: "text", text: `${toolName}: ${details.stage}` }], details });
+	throwIfAborted(signal);
+}
+
+export function createProposePatchTool(
+	manager: ControlledEditManager,
+): AgentTool<typeof proposePatchSchema, ControlledEditToolDetails> {
+	return {
+		name: "propose_patch",
+		label: "propose patch",
+		description:
+			"Prepare a bounded exact-text edit for an existing file under apps/learning-agent. This does not write. oldText must match exactly once; the result returns a proposalId and generated diff.",
+		parameters: proposePatchSchema,
+		executionMode: "sequential",
+		async execute(_toolCallId, rawInput, signal, onUpdate) {
+			if (!proposePatchValidator.Check(rawInput)) {
+				throw new Error("propose_patch arguments failed execution-time validation");
+			}
+			const input: ProposePatchInput = rawInput;
+			emitUpdate("propose_patch", onUpdate, { stage: "validating", path: input.path }, signal);
+			emitUpdate("propose_patch", onUpdate, { stage: "preparing", path: input.path }, signal);
+			const proposal = await manager.propose(input, signal);
+			throwIfAborted(signal);
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`Edit proposal ${proposal.id} for ${JSON.stringify(proposal.path)}`,
+							proposal.description ? `Description: ${JSON.stringify(proposal.description)}` : undefined,
+							`Expected SHA-256: ${proposal.expectedHash}`,
+							`Expires: ${proposal.expiresAt}`,
+							"",
+							proposal.diff,
+							"",
+							`Call apply_edit with proposalId ${JSON.stringify(proposal.id)} to request user approval.`,
+						]
+							.filter((line): line is string => line !== undefined)
+							.join("\n"),
+					},
+				],
+				details: {
+					stage: "awaiting_approval",
+					path: proposal.path,
+					proposalId: proposal.id,
+				},
+			} satisfies AgentToolResult<ControlledEditToolDetails>;
+		},
+	};
+}
+
+export function createApplyEditTool(
+	manager: ControlledEditManager,
+): AgentTool<typeof applyEditSchema, ControlledEditToolDetails> {
+	return {
+		name: "apply_edit",
+		label: "apply edit",
+		description:
+			"Apply a previously prepared edit proposal after explicit TUI approval. Learning Agent writers use a lock and the proposal is rejected if the file changed before the final recheck. Do not edit the target concurrently in external programs during approval.",
+		parameters: applyEditSchema,
+		executionMode: "sequential",
+		async execute(_toolCallId, rawInput, signal, onUpdate) {
+			if (!applyEditValidator.Check(rawInput)) {
+				throw new Error("apply_edit arguments failed execution-time validation");
+			}
+			const input: ApplyEditInput = rawInput;
+			const proposal = manager.getProposal(input.proposalId);
+			emitUpdate(
+				"apply_edit",
+				onUpdate,
+				{ stage: "applying", path: proposal.path, proposalId: proposal.id },
+				signal,
+			);
+			const applied = await manager.apply(input.proposalId, signal);
+			return {
+				content: [
+					{
+						type: "text",
+						text: [
+							`Applied edit proposal ${applied.proposalId} to ${JSON.stringify(applied.path)}.`,
+							`Previous SHA-256: ${applied.previousHash}`,
+							`New SHA-256: ${applied.newHash}`,
+							"The running process still uses the previously loaded code; restart Learning Agent to load this change.",
+						].join("\n"),
+					},
+				],
+				details: {
+					stage: "completed",
+					path: applied.path,
+					proposalId: applied.proposalId,
+					previousHash: applied.previousHash,
+					newHash: applied.newHash,
+				},
+			};
+		},
+	};
+}

@@ -19,6 +19,7 @@ import type {
 	AgentTool,
 	AgentToolCall,
 	AgentToolResult,
+	ContextRequestTraceTool,
 	StreamFn,
 } from "./types.ts";
 
@@ -287,12 +288,27 @@ async function streamAssistantResponse(
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
+	const originalMessages = config.traceContextRequests ? cloneForTrace(messages) : undefined;
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal);
 	}
+	const transformedMessages = originalMessages ? cloneForTrace(messages) : undefined;
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
+
+	if (originalMessages && transformedMessages) {
+		await emit({
+			type: "context_request",
+			trace: {
+				originalMessages,
+				transformedMessages,
+				llmMessages: cloneForTrace(llmMessages),
+				systemPrompt: context.systemPrompt,
+				tools: context.tools?.map(toTraceTool) ?? [],
+			},
+		});
+	}
 
 	// Build LLM context
 	const llmContext: Context = {
@@ -369,6 +385,64 @@ async function streamAssistantResponse(
 	}
 	await emit({ type: "message_end", message: finalMessage });
 	return finalMessage;
+}
+
+function cloneForTrace<T>(value: T): T {
+	try {
+		return structuredClone(value);
+	} catch {
+		return cloneTraceFallback(value, new WeakMap<object, unknown>()) as T;
+	}
+}
+
+function cloneTraceFallback(value: unknown, seen: WeakMap<object, unknown>): unknown {
+	if (typeof value === "function") return `[function ${value.name || "anonymous"}]`;
+	if (typeof value === "symbol") return String(value);
+	if (value === null || typeof value !== "object") return value;
+
+	const existing = seen.get(value);
+	if (existing !== undefined) return existing;
+	if (value instanceof Date) return new Date(value);
+	if (value instanceof ArrayBuffer) return value.slice(0);
+	if (ArrayBuffer.isView(value)) {
+		return cloneTraceFallback(Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)), seen);
+	}
+	if (Array.isArray(value)) {
+		const cloned: unknown[] = [];
+		seen.set(value, cloned);
+		for (const entry of value) cloned.push(cloneTraceFallback(entry, seen));
+		return cloned;
+	}
+	if (value instanceof Map) {
+		const cloned = new Map<unknown, unknown>();
+		seen.set(value, cloned);
+		for (const [key, entry] of value) {
+			cloned.set(cloneTraceFallback(key, seen), cloneTraceFallback(entry, seen));
+		}
+		return cloned;
+	}
+	if (value instanceof Set) {
+		const cloned = new Set<unknown>();
+		seen.set(value, cloned);
+		for (const entry of value) cloned.add(cloneTraceFallback(entry, seen));
+		return cloned;
+	}
+
+	const cloned: Record<string, unknown> = {};
+	seen.set(value, cloned);
+	for (const [key, entry] of Object.entries(value)) {
+		cloned[key] = cloneTraceFallback(entry, seen);
+	}
+	return cloned;
+}
+
+function toTraceTool(tool: AgentTool<any>): ContextRequestTraceTool {
+	return {
+		name: tool.name,
+		label: tool.label,
+		description: tool.description,
+		parameters: cloneForTrace(tool.parameters),
+	};
 }
 
 /**

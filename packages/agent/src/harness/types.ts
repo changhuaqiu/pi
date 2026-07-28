@@ -616,6 +616,13 @@ export interface SessionCompactEvent {
 	fromHook: boolean;
 }
 
+export interface CompactionUpdateEvent {
+	type: "compaction_update";
+	phase: "summarizing" | "turn_prefix" | "finalizing" | "committing";
+	/** Accumulated summary text produced so far. */
+	text: string;
+}
+
 export interface SessionBeforeTreeEvent {
 	type: "session_before_tree";
 	preparation: TreePreparation;
@@ -696,6 +703,7 @@ export type AgentHarnessOwnEvent<
 	| ToolCallEvent
 	| ToolResultEvent
 	| SessionBeforeCompactEvent
+	| CompactionUpdateEvent
 	| SessionCompactEvent
 	| SessionBeforeTreeEvent
 	| SessionTreeEvent
@@ -768,6 +776,7 @@ export type AgentHarnessEventResultMap = {
 	tool_call: ToolCallResult | undefined;
 	tool_result: ToolResultPatch | undefined;
 	session_before_compact: SessionBeforeCompactResult | undefined;
+	compaction_update: undefined;
 	session_compact: undefined;
 	session_before_tree: SessionBeforeTreeResult | undefined;
 	session_tree: undefined;
@@ -801,6 +810,14 @@ export interface CompactResult {
 	usage?: Usage;
 	retainedTail?: AgentMessage[];
 	details?: unknown;
+}
+
+export interface AgentHarnessCompactOptions {
+	/**
+	 * Cancels summary generation until the `compaction_update` event enters
+	 * `committing`. Session commit is intentionally non-cancellable.
+	 */
+	signal?: AbortSignal;
 }
 
 export interface NavigateTreeResult {

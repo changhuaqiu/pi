@@ -63,6 +63,7 @@ export interface CompactionSummaryMessage {
 	role: "compactionSummary";
 	summary: string;
 	tokensBefore: number;
+	retainedMessageCount?: number;
 	timestamp: number;
 }
 
@@ -110,11 +111,13 @@ export function createCompactionSummaryMessage(
 	summary: string,
 	tokensBefore: number,
 	timestamp: string,
+	retainedMessageCount?: number,
 ): CompactionSummaryMessage {
 	return {
 		role: "compactionSummary",
 		summary: summary,
 		tokensBefore,
+		retainedMessageCount,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }

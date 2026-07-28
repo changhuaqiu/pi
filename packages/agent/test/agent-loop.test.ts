@@ -230,14 +230,27 @@ describe("agentLoop with AgentMessage", () => {
 			tools: [],
 		};
 
-		const userPrompt: AgentMessage = createUserMessage("new message");
+		const userPrompt: AgentMessage = Object.assign(
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: "new message" }],
+				timestamp: Date.now(),
+			},
+			{ details: { nonCloneable: () => undefined } },
+		);
 
 		let transformedMessages: AgentMessage[] = [];
 		let convertedMessages: Message[] = [];
+		const events: AgentEvent[] = [];
 
 		const config: AgentLoopConfig = {
 			model: createModel(),
+			traceContextRequests: true,
 			transformContext: async (messages) => {
+				const newest = messages.at(-1);
+				if (newest?.role === "user" && Array.isArray(newest.content) && newest.content[0]?.type === "text") {
+					newest.content[0].text = "mutated new message";
+				}
 				// Keep only last 2 messages (prune old ones)
 				transformedMessages = messages.slice(-2);
 				return transformedMessages;
@@ -261,14 +274,33 @@ describe("agentLoop with AgentMessage", () => {
 
 		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
 
-		for await (const _ of stream) {
-			// consume
+		for await (const event of stream) {
+			events.push(event);
 		}
 
 		// transformContext should have been called first, keeping only last 2
 		expect(transformedMessages.length).toBe(2);
 		// Then convertToLlm receives the pruned messages
 		expect(convertedMessages.length).toBe(2);
+		const contextRequest = events.find((event) => event.type === "context_request");
+		expect(contextRequest?.type).toBe("context_request");
+		if (contextRequest?.type === "context_request") {
+			expect(contextRequest.trace.originalMessages).toHaveLength(5);
+			expect(contextRequest.trace.transformedMessages).toHaveLength(2);
+			expect(contextRequest.trace.llmMessages).toHaveLength(2);
+			expect(contextRequest.trace.systemPrompt).toBe("You are helpful.");
+			expect(contextRequest.trace.tools).toEqual([]);
+			const originalNewest = contextRequest.trace.originalMessages.at(-1);
+			const transformedNewest = contextRequest.trace.transformedMessages.at(-1);
+			expect(originalNewest?.role === "user" ? originalNewest.content[0] : undefined).toMatchObject({
+				type: "text",
+				text: "new message",
+			});
+			expect(transformedNewest?.role === "user" ? transformedNewest.content[0] : undefined).toMatchObject({
+				type: "text",
+				text: "mutated new message",
+			});
+		}
 	});
 
 	it("should handle tool calls and results", async () => {
@@ -1130,6 +1162,7 @@ describe("agentLoop with AgentMessage", () => {
 		let callbackContextRoles: string[] = [];
 		const config: AgentLoopConfig = {
 			model: createModel(),
+			traceContextRequests: true,
 			convertToLlm: identityConverter,
 			getSteeringMessages: async () => {
 				steeringPolls++;
@@ -1187,6 +1220,7 @@ describe("agentLoop with AgentMessage", () => {
 			"turn_start",
 			"message_start",
 			"message_end",
+			"context_request",
 			"message_start",
 			"message_end",
 			"tool_execution_start",

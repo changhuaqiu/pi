@@ -193,6 +193,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * ```
 	 */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	/** Emit context_request events with snapshots of each provider request stage. */
+	traceContextRequests?: boolean;
 
 	/**
 	 * Resolves an API key dynamically for each LLM call.
@@ -412,6 +414,31 @@ export interface AgentContext {
 	tools?: AgentTool<any>[];
 }
 
+/** Serializable tool metadata captured immediately before a provider request. */
+export interface ContextRequestTraceTool {
+	name: string;
+	label: string;
+	description: string;
+	parameters: TSchema;
+}
+
+/**
+ * Read-only snapshots of each context stage immediately before a provider request.
+ *
+ * These snapshots are emitted for observability only. They are not added to agent
+ * state, sent to the model, or persisted by the core agent.
+ */
+export interface ContextRequestTrace {
+	/** Agent messages before transformContext runs. */
+	originalMessages: AgentMessage[];
+	/** Agent messages returned by transformContext. */
+	transformedMessages: AgentMessage[];
+	/** Provider-compatible messages returned by convertToLlm. */
+	llmMessages: Message[];
+	systemPrompt: string;
+	tools: ContextRequestTraceTool[];
+}
+
 /**
  * Events emitted by the Agent for UI updates.
  *
@@ -426,6 +453,8 @@ export type AgentEvent =
 	// Turn lifecycle - a turn is one assistant response + any tool calls/results
 	| { type: "turn_start" }
 	| { type: "turn_end"; message: AgentMessage; toolResults: ToolResultMessage[] }
+	// Context observability - emitted after convertToLlm and before the provider request
+	| { type: "context_request"; trace: ContextRequestTrace }
 	// Message lifecycle - emitted for user, assistant, and toolResult messages
 	| { type: "message_start"; message: AgentMessage }
 	// Only emitted for assistant messages during streaming

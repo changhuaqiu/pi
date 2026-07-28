@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added abortable compaction and read-only streaming progress events for generated summaries.
+
 ## [0.81.1] - 2026-07-21
 
 ### Added
