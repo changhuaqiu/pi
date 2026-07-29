@@ -84,6 +84,36 @@ test("redaction removes workspace paths and secret values", () => {
 	assert.deepEqual(result.details, { password: "<redacted>", path: "<workspace>\\src" });
 });
 
+test("redaction removes standalone provider and Git hosting keys from Git output", () => {
+	const result = redactToolResult(
+		[
+			{
+				type: "text",
+				text: "removed sk-abcdefghijklmnopqrstuvwxyz123456 and ghp_abcdefghijklmnopqrstuvwxyz123456",
+			},
+		],
+		{},
+		"C:\\workspace",
+	);
+
+	assert.deepEqual(result.content, [
+		{ type: "text", text: "removed <redacted-key> and <redacted-key>" },
+	]);
+});
+
+test("redaction keeps final model-facing text within the shared UTF-8 limit", () => {
+	const result = redactToolResult(
+		[{ type: "text", text: "x😀".repeat(20_000) }],
+		{},
+		"x",
+	);
+	const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
+	assert.ok(Buffer.byteLength(text, "utf8") <= 64 * 1024);
+	assert.match(text, /\[tool result truncated after redaction\]$/);
+	assert.doesNotMatch(text, /�/);
+});
+
 test("propose_patch audit records hashes instead of source text", () => {
 	const record = createAuditRecord(
 		"call-4",
@@ -102,4 +132,20 @@ test("propose_patch audit records hashes instead of source text", () => {
 	assert.equal(record.input.newTextBytes, 18);
 	assert.equal("oldText" in record.input, false);
 	assert.equal("newText" in record.input, false);
+});
+
+test("Git tool calls use the shared audit record", () => {
+	const record = createAuditRecord(
+		"call-5",
+		"git_diff",
+		{ from: "HEAD~1", to: "HEAD", path: "apps/learning-agent" },
+		"allowed",
+	);
+
+	assert.equal(record.toolName, "git_diff");
+	assert.deepEqual(record.input, {
+		from: "HEAD~1",
+		to: "HEAD",
+		path: "apps/learning-agent",
+	});
 });

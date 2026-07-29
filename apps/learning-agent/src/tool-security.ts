@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ControlledEditToolName } from "./controlled-edit-tools.ts";
+import type { GitToolName } from "./git-tools.ts";
 import type { ReadOnlyToolName } from "./read-only-tools.ts";
 
-export type LearningToolName = "workspace_info" | ReadOnlyToolName | ControlledEditToolName;
+export type LearningToolName =
+	| "workspace_info"
+	| ReadOnlyToolName
+	| ControlledEditToolName
+	| GitToolName;
 
 export interface ToolAuditRecord {
 	toolCallId: string;
@@ -12,6 +17,8 @@ export interface ToolAuditRecord {
 	input: Record<string, unknown>;
 	timestamp: string;
 }
+
+const maxToolResultTextBytes = 64 * 1024;
 
 function hashAuditText(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
@@ -64,10 +71,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function redactText(text: string, root: string): string {
 	let result = text.replaceAll(root, "<workspace>").replaceAll(root.replaceAll("\\", "/"), "<workspace>");
 	result = result.replace(/(Bearer\s+)[^\s]+/gi, "$1<redacted>");
-	return result.replace(
+	result = result.replace(
 		/\b(api[_-]?key|access[_-]?token|token|password|secret)(\s*[:=]\s*)(["']?)[^\s,"'}]+/gi,
 		"$1$2$3<redacted>",
 	);
+	result = result.replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, "<redacted-key>");
+	result = result.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "<redacted-key>");
+	return result.replace(/\bAKIA[0-9A-Z]{16}\b/g, "<redacted-key>");
+}
+
+function boundRedactedText(text: string): string {
+	const suffix = "\n[tool result truncated after redaction]";
+	const buffer = Buffer.from(text, "utf8");
+	if (buffer.length <= maxToolResultTextBytes) return text;
+	const maxContentBytes = maxToolResultTextBytes - Buffer.byteLength(suffix, "utf8");
+	let end = maxContentBytes;
+	while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+	return `${buffer.subarray(0, end).toString("utf8")}${suffix}`;
 }
 
 function redactUnknown(value: unknown, root: string, seen: WeakSet<object>): unknown {
@@ -92,7 +112,11 @@ export function redactToolResult(
 	root: string,
 ): { content: AgentToolResult<unknown>["content"]; details: unknown } {
 	return {
-		content: content.map((item) => (item.type === "text" ? { ...item, text: redactText(item.text, root) } : item)),
+		content: content.map((item) =>
+			item.type === "text"
+				? { ...item, text: boundRedactedText(redactText(item.text, root)) }
+				: item,
+		),
 		details: redactUnknown(details, root, new WeakSet()),
 	};
 }

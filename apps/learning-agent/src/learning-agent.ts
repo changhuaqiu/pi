@@ -43,6 +43,14 @@ import {
 	createSearchTextTool,
 } from "./read-only-tools.ts";
 import {
+	createGitBlameTool,
+	createGitDiffTool,
+	createGitLogTool,
+	createGitShowTool,
+	createGitStatusTool,
+	createNodeGitOperations,
+} from "./git-tools.ts";
+import {
 	createAuditRecord,
 	freezeToolInput,
 	type LearningToolName,
@@ -221,6 +229,7 @@ export class HarnessLearningAgent implements LearningAgent {
 
 	private buildHarness(session: Session<JsonlSessionMetadata>): LearningHarness {
 		const readOperations = createNodeReadOnlyWorkspaceOperations(this.config.workspaceRoot);
+		const gitOperations = createNodeGitOperations(this.config.workspaceRoot);
 		const editManager = createControlledEditManager({
 			operations: createNodeControlledEditOperations(this.config.workspaceRoot),
 		});
@@ -234,11 +243,11 @@ export class HarnessLearningAgent implements LearningAgent {
 			createSearchTextTool(readOperations),
 			createProposePatchTool(editManager),
 			createApplyEditTool(editManager),
-			createGitStatusTool(this.config.workspaceRoot),
-			createGitDiffTool(this.config.workspaceRoot),
-			createGitLogTool(this.config.workspaceRoot),
-			createGitShowTool(this.config.workspaceRoot),
-			createGitBlameTool(this.config.workspaceRoot),
+			createGitStatusTool(gitOperations),
+			createGitDiffTool(gitOperations),
+			createGitLogTool(gitOperations),
+			createGitShowTool(gitOperations),
+			createGitBlameTool(gitOperations),
 		];
 		const harness = new AgentHarness<Skill, PromptTemplate, LearningTool>({
 			env: this.env,
@@ -248,13 +257,14 @@ export class HarnessLearningAgent implements LearningAgent {
 			tools,
 			systemPrompt: [
 				"You are Learning Agent, a concise coding assistant used to study reliable agent execution.",
-				"You can inspect the current workspace with workspace_info, list_files, read_file, and search_text.",
+				"You can inspect the current workspace with workspace_info, list_files, read_file, search_text, and the read-only git_* tools.",
 				"Use list_files to discover structure, search_text to locate symbols, and read_file for bounded source ranges.",
+				"Use git_status, git_diff, git_log, git_show, and git_blame to inspect repository history and changes without modifying Git state.",
 				"Use propose_patch with exact oldText and newText to prepare an edit only under apps/learning-agent.",
 				"propose_patch does not write. To apply it, call apply_edit with its proposalId; the application will ask the user for approval.",
 				"Never claim an edit succeeded until apply_edit returns success. The running process must be restarted to load edited code.",
 				"All tool paths are relative to the injected workspace root.",
-				"Never claim to execute commands. Do not edit outside apps/learning-agent.",
+				"Never claim to execute arbitrary shell commands. Git tools are limited to read-only inspection. Do not edit outside apps/learning-agent.",
 			].join("\n"),
 		});
 		harness.on("tool_call", async (event) => {
@@ -537,235 +547,4 @@ export function getMessageText(message: AgentMessage): string {
 			.join("\n");
 	}
 	return "";
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Git read-only tools (inlined to avoid creating a new file — see git-tools.ts)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { type Static, Type } from "typebox";
-import { Compile } from "typebox/compile";
-
-const execFileAsync = promisify(execFile);
-
-export type GitToolName = "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame";
-
-const gitStatusSchema = Type.Object(
-	{ path: Type.Optional(Type.String({ description: "Workspace-relative path to limit status to", maxLength: 500 })) },
-	{ additionalProperties: false },
-);
-const gitDiffSchema = Type.Object(
-	{
-		path: Type.Optional(Type.String({ description: "Workspace-relative file path to limit diff to", maxLength: 500 })),
-		staged: Type.Optional(Type.Boolean({ description: "Show staged changes instead of unstaged (default false)" })),
-		from: Type.Optional(Type.String({ description: "Source commit/ref, defaults to HEAD" })),
-		to: Type.Optional(Type.String({ description: "Target commit/ref, defaults to working tree" })),
-	},
-	{ additionalProperties: false },
-);
-const gitLogSchema = Type.Object(
-	{
-		maxCount: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max entries, default 20" })),
-		path: Type.Optional(Type.String({ description: "Workspace-relative file path to filter by", maxLength: 500 })),
-		author: Type.Optional(Type.String({ description: "Filter by author name/email", maxLength: 200 })),
-		since: Type.Optional(Type.String({ description: "ISO date to start from, e.g. 2025-01-01", maxLength: 50 })),
-	},
-	{ additionalProperties: false },
-);
-const gitShowSchema = Type.Object(
-	{
-		commit: Type.String({ description: "Commit hash or ref to show", minLength: 1, maxLength: 100 }),
-		path: Type.Optional(Type.String({ description: "Workspace-relative file path to limit output to", maxLength: 500 })),
-	},
-	{ additionalProperties: false },
-);
-const gitBlameSchema = Type.Object(
-	{
-		path: Type.String({ description: "Workspace-relative file path", minLength: 1, maxLength: 500 }),
-		startLine: Type.Optional(Type.Integer({ minimum: 1, description: "First line to show (1-based)" })),
-		maxLines: Type.Optional(Type.Integer({ minimum: 1, maximum: 500, description: "Max lines to show, default 50" })),
-	},
-	{ additionalProperties: false },
-);
-
-const gitStatusValidator = Compile(gitStatusSchema);
-const gitDiffValidator = Compile(gitDiffSchema);
-const gitLogValidator = Compile(gitLogSchema);
-const gitShowValidator = Compile(gitShowSchema);
-const gitBlameValidator = Compile(gitBlameSchema);
-
-export interface GitStatusEntry { path: string; index: string; worktree: string; }
-export interface GitStatusDetails { branch: string; staged: GitStatusEntry[]; unstaged: GitStatusEntry[]; untracked: string[]; }
-export interface GitDiffDetails { diff: string; }
-export interface GitLogEntry { hash: string; hashAbbrev: string; author: string; date: string; message: string; }
-export interface GitLogDetails { entries: GitLogEntry[]; truncated: boolean; }
-export interface GitShowDetails { commit: GitLogEntry; diff: string; }
-export interface GitBlameLine { line: number; hash: string; hashAbbrev: string; author: string; date: string; content: string; }
-export interface GitBlameDetails { lines: GitBlameLine[]; }
-
-async function runGit(args: string[], cwd: string, signal?: AbortSignal): Promise<string> {
-	const { stdout } = await execFileAsync("git", args, { cwd, maxBuffer: 1024 * 1024, signal, timeout: 15_000 });
-	return stdout;
-}
-
-function gitCheckSignal(signal?: AbortSignal): void {
-	if (signal?.aborted) { const e = new Error("Operation aborted"); e.name = "AbortError"; throw e; }
-}
-
-function gitDetails(d: unknown): { content: [{ type: "text"; text: string }]; details: unknown } {
-	return { content: [{ type: "text" as const, text: JSON.stringify(d, null, 2) }], details: d };
-}
-
-export function createGitStatusTool(workspaceRoot: string): AgentTool<typeof gitStatusSchema, GitStatusDetails> {
-	return {
-		name: "git_status", label: "git status",
-		description: "Show the working tree status: branch, staged/unstaged changes, and untracked files.",
-		parameters: gitStatusSchema, executionMode: "sequential",
-		async execute(_id, raw, signal, onUpdate) {
-			if (!gitStatusValidator.Check(raw)) throw new Error("git_status: invalid arguments");
-			const input: Static<typeof gitStatusSchema> = raw;
-			onUpdate?.({ content: [{ type: "text", text: "git_status: running…" }], details: {} });
-			const args = ["status", "--porcelain=v2", "--branch"];
-			if (input.path) args.push("--", input.path);
-			const output = await runGit(args, workspaceRoot, signal);
-			gitCheckSignal(signal);
-			return gitDetails(parsePorcelainV2(output)) as AgentToolResult<GitStatusDetails>;
-		},
-	};
-}
-
-export function createGitDiffTool(workspaceRoot: string): AgentTool<typeof gitDiffSchema, GitDiffDetails> {
-	return {
-		name: "git_diff", label: "git diff",
-		description: "Show changes between commits, the index, and working tree.",
-		parameters: gitDiffSchema, executionMode: "sequential",
-		async execute(_id, raw, signal, onUpdate) {
-			if (!gitDiffValidator.Check(raw)) throw new Error("git_diff: invalid arguments");
-			const input: Static<typeof gitDiffSchema> = raw;
-			onUpdate?.({ content: [{ type: "text", text: "git_diff: running…" }], details: {} });
-			const args = ["diff", "--patch", "--minimal"];
-			if (input.staged) args.push("--cached");
-			if (input.from) args.push(input.from);
-			if (input.to) args.push(input.to);
-			if (input.path) args.push("--", input.path);
-			const diff = await runGit(args, workspaceRoot, signal);
-			gitCheckSignal(signal);
-			return gitDetails({ diff });
-		},
-	};
-}
-
-export function createGitLogTool(workspaceRoot: string): AgentTool<typeof gitLogSchema, GitLogDetails> {
-	return {
-		name: "git_log", label: "git log",
-		description: "Show commit history.",
-		parameters: gitLogSchema, executionMode: "sequential",
-		async execute(_id, raw, signal, onUpdate) {
-			if (!gitLogValidator.Check(raw)) throw new Error("git_log: invalid arguments");
-			const input: Static<typeof gitLogSchema> = raw;
-			onUpdate?.({ content: [{ type: "text", text: "git_log: running…" }], details: {} });
-			const args = ["log", `--max-count=${input.maxCount ?? 20}`, "--format=%H%n%h%n%an%n%aI%n%s"];
-			if (input.author) args.push(`--author=${input.author}`);
-			if (input.since) args.push(`--since=${input.since}`);
-			if (input.path) args.push("--", input.path);
-			const output = await runGit(args, workspaceRoot, signal);
-			gitCheckSignal(signal);
-			const entries = parseLogFormat(output, input.maxCount ?? 20);
-			return gitDetails({ entries, truncated: entries.length >= (input.maxCount ?? 20) });
-		},
-	};
-}
-
-export function createGitShowTool(workspaceRoot: string): AgentTool<typeof gitShowSchema, GitShowDetails> {
-	return {
-		name: "git_show", label: "git show",
-		description: "Show details and diff for a specific commit.",
-		parameters: gitShowSchema, executionMode: "sequential",
-		async execute(_id, raw, signal, onUpdate) {
-			if (!gitShowValidator.Check(raw)) throw new Error("git_show: invalid arguments");
-			const input: Static<typeof gitShowSchema> = raw;
-			onUpdate?.({ content: [{ type: "text", text: "git_show: running…" }], details: {} });
-			const metaOutput = await runGit(["log", "--max-count=1", "--format=%H%n%h%n%an%n%aI%n%s", input.commit], workspaceRoot, signal);
-			const commits = parseLogFormat(metaOutput, 1);
-			const commit = commits[0];
-			if (!commit) throw new Error(`Commit not found: ${input.commit}`);
-			const diffArgs = ["show", "--patch", "--minimal", commit.hash];
-			if (input.path) diffArgs.push("--", input.path);
-			const diff = await runGit(diffArgs, workspaceRoot, signal);
-			gitCheckSignal(signal);
-			return gitDetails({ commit, diff });
-		},
-	};
-}
-
-export function createGitBlameTool(workspaceRoot: string): AgentTool<typeof gitBlameSchema, GitBlameDetails> {
-	return {
-		name: "git_blame", label: "git blame",
-		description: "Show line-by-line authorship for a file.",
-		parameters: gitBlameSchema, executionMode: "sequential",
-		async execute(_id, raw, signal, onUpdate) {
-			if (!gitBlameValidator.Check(raw)) throw new Error("git_blame: invalid arguments");
-			const input: Static<typeof gitBlameSchema> = raw;
-			onUpdate?.({ content: [{ type: "text", text: "git_blame: running…" }], details: {} });
-			const maxLines = input.maxLines ?? 50;
-			const startLine = input.startLine ?? 1;
-			const range = `${startLine},${startLine + maxLines - 1}`;
-			const output = await runGit(["blame", "--porcelain", "-L", range, "--", input.path], workspaceRoot, signal);
-			gitCheckSignal(signal);
-			return gitDetails({ lines: parseBlamePorcelain(output) });
-		},
-	};
-}
-
-// ── porcelain v2 parser ──
-
-function parsePorcelainV2(output: string): GitStatusDetails {
-	const lines = output.split("\n").filter((l) => l.length > 0);
-	let branch = "(unknown)";
-	const staged: GitStatusEntry[] = [];
-	const unstaged: GitStatusEntry[] = [];
-	const untracked: string[] = [];
-	for (const line of lines) {
-		if (line.startsWith("# branch.head ")) { branch = line.slice(15); if (branch === "(detached)") branch = "HEAD (detached)"; }
-		else if (line.startsWith("1 ")) {
-			const parts = line.slice(2).split(" ");
-			const idx = parts[0]?.[0] ?? ".";
-			const wt = parts[0]?.[1] ?? ".";
-			const p = parts.slice(2).join(" ");
-			const entry: GitStatusEntry = { path: p, index: idx, worktree: wt };
-			if (idx !== ".") staged.push(entry);
-			if (wt !== ".") unstaged.push(entry);
-		} else if (line.startsWith("? ")) { untracked.push(line.slice(2)); }
-	}
-	return { branch, staged, unstaged, untracked };
-}
-
-function parseLogFormat(output: string, maxCount: number): GitLogEntry[] {
-	const lines = output.trim().split("\n").filter((l) => l.length > 0);
-	const entries: GitLogEntry[] = [];
-	for (let i = 0; i + 4 < lines.length && entries.length < maxCount; i += 5) {
-		entries.push({ hash: lines[i]!, hashAbbrev: lines[i + 1]!, author: lines[i + 2]!, date: lines[i + 3]!, message: lines[i + 4]! });
-	}
-	return entries;
-}
-
-function parseBlamePorcelain(output: string): GitBlameLine[] {
-	const lines = output.split("\n");
-	const result: GitBlameLine[] = [];
-	let hash = "", hashAbbrev = "", author = "", date = "", lineNum = 0;
-	for (const line of lines) {
-		if (/^[0-9a-f]{40}\s+\d+\s+\d+/.test(line)) {
-			const parts = line.split(/\s+/);
-			hash = parts[0] ?? ""; hashAbbrev = hash.slice(0, 8); lineNum = parseInt(parts[1] ?? "0", 10);
-		} else if (line.startsWith("author ")) { author = line.slice(7); }
-		else if (line.startsWith("author-time ")) {
-			const ts = parseInt(line.slice(12), 10);
-			date = ts > 0 ? new Date(ts * 1000).toISOString() : "";
-		} else if (line.startsWith("\t")) {
-			result.push({ line: lineNum + result.length, hash, hashAbbrev, author, date, content: line.slice(1) });
-		}
-	}
-	return result;
 }

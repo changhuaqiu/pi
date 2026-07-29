@@ -11,6 +11,7 @@ import {
 	Text,
 	TUI,
 	TUI_KEYBINDINGS,
+	truncateToWidth,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
 import type { LearningAgent, LearningAgentUiEvent } from "./learning-agent.ts";
@@ -69,6 +70,61 @@ function colorContextPercent(percent: number): string {
 
 function truncateId(id: string, maxLen = 8): string {
 	return id.length <= maxLen ? id : `${id.slice(0, maxLen)}…`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function compactSingleLine(value: string, maxLength: number): string {
+	const compact = sanitizeTerminalText(value).replace(/\s+/g, " ").trim();
+	return compact.length <= maxLength ? compact : `${compact.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function formatToolValue(key: string, value: unknown): string {
+	if (/oldText|newText|apiKey|token|password|secret/i.test(key)) {
+		return typeof value === "string" ? `<${value.length} chars>` : "<redacted>";
+	}
+	if (typeof value === "string") return JSON.stringify(compactSingleLine(value, 48));
+	try {
+		return compactSingleLine(JSON.stringify(value) ?? String(value), 48);
+	} catch {
+		return "<unserializable>";
+	}
+}
+
+export function formatToolActivity(
+	toolName: string,
+	args: Record<string, unknown>,
+	progress?: string,
+	maxLength = 140,
+): string {
+	const argumentsText = Object.entries(args)
+		.map(([key, value]) => `${key}=${formatToolValue(key, value)}`)
+		.join(" ");
+	const suffix = progress ? ` · ${compactSingleLine(progress, 80)}` : "";
+	return truncateToWidth(
+		`${toolName}${argumentsText ? ` ${argumentsText}` : ""}${suffix}`,
+		maxLength,
+		"…",
+	);
+}
+
+export function moveHistoryIndex(
+	currentIndex: number,
+	historyLength: number,
+	direction: -1 | 1,
+): number {
+	return Math.max(0, Math.min(historyLength, currentIndex + direction));
+}
+
+function getToolResultSummary(result: unknown): string | undefined {
+	if (!isRecord(result) || !Array.isArray(result.content)) return undefined;
+	for (const item of result.content) {
+		if (!isRecord(item) || item.type !== "text" || typeof item.text !== "string") continue;
+		return compactSingleLine(item.text.split(/\r?\n/, 1)[0] ?? "", 80);
+	}
+	return undefined;
 }
 
 // ── diff highlighting ────────────────────────────────────────────────────────
@@ -149,6 +205,12 @@ interface Command {
 	handler: (args: string) => Promise<string | undefined> | string | undefined;
 }
 
+interface ToolActivityCard {
+	component: Text;
+	args: Record<string, unknown>;
+	startedAt: number;
+}
+
 // ── TUI ──────────────────────────────────────────────────────────────────────
 
 export class LearningAgentUserMessage extends Box {
@@ -177,11 +239,15 @@ export class LearningAgentTui {
 
 	private activeAssistant?: Markdown;
 	private activeCompaction?: Markdown;
+	private readonly activeTools = new Map<string, ToolActivityCard>();
 	private done?: () => void;
 	private pendingApprovalId?: string;
 	private shuttingDown = false;
 	private unsubscribeAgent: () => void = () => {};
 	private pendingContinue = false;
+	private activityLabel = "idle";
+	private statusOverride?: string;
+	private contextPercent?: number;
 
 	// Session metadata for the status bar
 	private sessionId = "";
@@ -191,7 +257,7 @@ export class LearningAgentTui {
 
 	// Input history
 	private inputHistory: string[] = [];
-	private historyIndex = -1;
+	private historyIndex = 0;
 	private draftBeforeHistory = "";
 
 	// Timing
@@ -263,6 +329,7 @@ export class LearningAgentTui {
 					this.tokenInput = 0;
 					this.tokenOutput = 0;
 					this.transcriptContainer.clear();
+					this.activeTools.clear();
 					this.approvalContainer.clear();
 					await this.renderHistory(await this.agent.getMessages());
 					await this.updateStatusBar();
@@ -283,6 +350,7 @@ export class LearningAgentTui {
 					this.tokenInput = 0;
 					this.tokenOutput = 0;
 					this.transcriptContainer.clear();
+					this.activeTools.clear();
 					this.approvalContainer.clear();
 					await this.updateStatusBar();
 					this.updateHeader();
@@ -350,6 +418,7 @@ export class LearningAgentTui {
 				description: "Clear the transcript display (session is preserved)",
 				handler: () => {
 					this.transcriptContainer.clear();
+					this.activeTools.clear();
 					return undefined; // no extra line needed
 				},
 			},
@@ -513,19 +582,29 @@ export class LearningAgentTui {
 	}
 
 	private async updateStatusBar(): Promise<void> {
+		try {
+			const context = await this.agent.getContextInfo();
+			this.contextPercent = context.contextWindow > 0 ? context.percent : undefined;
+		} catch {
+			this.contextPercent = undefined;
+		}
+		this.renderStatusBar();
+	}
+
+	private renderStatusBar(): void {
+		if (this.statusOverride) {
+			this.statusText.setText(this.statusOverride);
+			this.tui.requestRender();
+			return;
+		}
 		const parts: string[] = [];
+		if (this.activityLabel !== "idle") parts.push(chalk.yellow(this.activityLabel));
 		if (this.modelId) parts.push(chalk.dim(this.modelId));
 		if (this.sessionId) parts.push(chalk.dim(`s:${truncateId(this.sessionId)}`));
 		if (this.tokenInput > 0 || this.tokenOutput > 0) {
 			parts.push(chalk.dim(`↑${this.tokenInput} ↓${this.tokenOutput}`));
 		}
-		// Show context usage
-		try {
-			const ctx = await this.agent.getContextInfo();
-			if (ctx.contextWindow > 0) {
-				parts.push(`ctx ${colorContextPercent(ctx.percent)}`);
-			}
-		} catch { /* ignore */ }
+		if (this.contextPercent !== undefined) parts.push(`ctx ${colorContextPercent(this.contextPercent)}`);
 		const statusLine = parts.join(" │ ");
 		this.statusText.setText(statusLine || chalk.dim("idle"));
 		this.tui.requestRender();
@@ -536,16 +615,22 @@ export class LearningAgentTui {
 	private navigateHistory(direction: number): void {
 		if (this.inputHistory.length === 0) return;
 
-		if (this.historyIndex === -1) {
+		if (this.historyIndex === this.inputHistory.length) {
 			this.draftBeforeHistory = this.editor.getText();
 		}
 
-		const newIndex = this.historyIndex + direction;
-		if (newIndex < -1) return;
-		if (newIndex >= this.inputHistory.length) return;
-
+		const normalizedDirection = direction < 0 ? -1 : 1;
+		const newIndex = moveHistoryIndex(
+			this.historyIndex,
+			this.inputHistory.length,
+			normalizedDirection,
+		);
+		if (newIndex === this.historyIndex) return;
 		this.historyIndex = newIndex;
-		const text = newIndex === -1 ? this.draftBeforeHistory : this.inputHistory[newIndex];
+		const text =
+			newIndex === this.inputHistory.length
+				? this.draftBeforeHistory
+				: (this.inputHistory[newIndex] ?? "");
 		this.editor.setText(text);
 		this.tui.requestRender();
 	}
@@ -584,6 +669,10 @@ export class LearningAgentTui {
 			this.addSystemLine(
 				chalk.red(`command error: ${error instanceof Error ? error.message : String(error)}`),
 			);
+		} finally {
+			if (!this.agent.isBusy() && !this.pendingApprovalId && !this.shuttingDown) {
+				this.setBusy(false);
+			}
 		}
 		return true;
 	}
@@ -619,34 +708,59 @@ export class LearningAgentTui {
 		this.tui.requestRender();
 	}
 
-	private addToolCallCard(toolName: string, args: Record<string, unknown>): void {
-		const summary = Object.entries(args)
-			.map(([k, v]) => {
-				const sv = typeof v === "string" ? (v.length > 60 ? `${v.slice(0, 57)}…` : v) : JSON.stringify(v);
-				return `${chalk.dim(k)}=${chalk.yellow(sv)}`;
-			})
-			.join(" ");
+	private addToolCallCard(
+		toolCallId: string,
+		toolName: string,
+		args: Record<string, unknown>,
+	): void {
+		const component = new Text(`○ ${chalk.yellow(formatToolActivity(toolName, args, "starting"))}`, 1, 1);
 		this.transcriptContainer.addChild(new Spacer(1));
-		this.transcriptContainer.addChild(
-			new Text(`${chalk.dim("⚙")} ${chalk.yellow.bold(toolName)} ${summary}`, 1, 1),
-		);
+		this.transcriptContainer.addChild(component);
+		this.activeTools.set(toolCallId, { component, args, startedAt: Date.now() });
 		this.tui.requestRender();
 	}
 
-	private addToolResultCard(toolName: string, isError: boolean): void {
-		const icon = isError ? chalk.red("✖") : chalk.green("✔");
-		this.transcriptContainer.addChild(
-			new Text(`${icon} ${chalk.dim(toolName)} ${isError ? chalk.red("error") : chalk.green("ok")}`, 1, 2),
-		);
+	private updateToolCallCard(
+		toolCallId: string,
+		toolName: string,
+		partialResult: unknown,
+	): void {
+		const card = this.activeTools.get(toolCallId);
+		if (!card) return;
+		const progress = getToolResultSummary(partialResult) ?? "running";
+		card.component.setText(`◐ ${chalk.yellow(formatToolActivity(toolName, card.args, progress))}`);
+		this.tui.requestRender();
+	}
+
+	private finishToolCallCard(
+		toolCallId: string,
+		toolName: string,
+		result: unknown,
+		isError: boolean,
+	): void {
+		const card = this.activeTools.get(toolCallId);
+		const elapsed = card ? Date.now() - card.startedAt : 0;
+		const args = card?.args ?? {};
+		const resultSummary = getToolResultSummary(result);
+		const outcome = isError
+			? `error · ${formatDuration(elapsed)}`
+			: `${resultSummary ? `${resultSummary} · ` : ""}${formatDuration(elapsed)}`;
+		const line = formatToolActivity(toolName, args, outcome);
+		if (card) {
+			card.component.setText(isError ? `✖ ${chalk.red(line)}` : `✔ ${chalk.green(line)}`);
+			this.activeTools.delete(toolCallId);
+		} else {
+			this.transcriptContainer.addChild(
+				new Text(isError ? `✖ ${chalk.red(line)}` : `✔ ${chalk.green(line)}`, 1, 1),
+			);
+		}
 		this.tui.requestRender();
 	}
 
 	private setBusy(busy: boolean, label = busy ? "thinking…" : "idle"): void {
 		this.editor.disableSubmit = busy;
-		const stateLabel = busy ? chalk.yellow(label) : chalk.dim(label);
-		const sessionPart = chalk.dim(`s:${truncateId(this.sessionId)}`);
-		this.statusText.setText(`${stateLabel}  ${sessionPart}`);
-		this.tui.requestRender();
+		this.activityLabel = busy ? label : "idle";
+		this.renderStatusBar();
 	}
 
 	// ── input handling ──────────────────────────────────────────────────────
@@ -657,7 +771,7 @@ export class LearningAgentTui {
 
 		// Push to history
 		this.inputHistory.push(text);
-		this.historyIndex = -1;
+		this.historyIndex = this.inputHistory.length;
 		this.draftBeforeHistory = "";
 		this.editor.setText("");
 
@@ -740,14 +854,15 @@ export class LearningAgentTui {
 			this.approvalContainer.addChild(
 				new ApprovalCard(proposal.path, proposal.description, proposal.diff),
 			);
-			this.statusText.setText(
-				chalk.bold.yellow("🔐 Edit approval pending — [y] approve  [n] reject  [esc] reject"),
+			this.statusOverride = chalk.bold.yellow(
+				"Edit approval pending — [y] approve  [n] reject  [esc] reject",
 			);
-			this.tui.requestRender();
+			this.renderStatusBar();
 			return;
 		}
 		if (event.type === "approval_resolved") {
 			if (this.pendingApprovalId === event.requestId) this.pendingApprovalId = undefined;
+			this.statusOverride = undefined;
 			// Clear the approval card
 			this.approvalContainer.clear();
 			this.addSystemLine(event.approved ? chalk.green("✓ edit approved") : chalk.red("✗ edit rejected"));
@@ -761,9 +876,10 @@ export class LearningAgentTui {
 			return;
 		}
 		if (event.type === "message_start") {
+			this.messageCount++;
+			this.updateHeader();
 			if (event.message.role === "user") this.addUserMessage(getMessageText(event.message));
 			if (event.message.role === "assistant") {
-				this.messageCount++;
 				this.activeAssistant = this.addAssistantMessage(getMessageText(event.message));
 			}
 		} else if (event.type === "message_update" && this.activeAssistant) {
@@ -798,9 +914,20 @@ export class LearningAgentTui {
 			this.updateHeader();
 		} else if (event.type === "tool_execution_start") {
 			this.setBusy(true, `tool: ${event.toolName}`);
-			this.addToolCallCard(event.toolName, event.args as Record<string, unknown>);
+			this.addToolCallCard(
+				event.toolCallId,
+				event.toolName,
+				event.args as Record<string, unknown>,
+			);
+		} else if (event.type === "tool_execution_update") {
+			this.updateToolCallCard(event.toolCallId, event.toolName, event.partialResult);
 		} else if (event.type === "tool_execution_end") {
-			this.addToolResultCard(event.toolName, event.isError);
+			this.finishToolCallCard(
+				event.toolCallId,
+				event.toolName,
+				event.result,
+				event.isError,
+			);
 			this.setBusy(true, "thinking…");
 		} else if (event.type === "abort") {
 			this.setBusy(false);

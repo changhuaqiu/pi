@@ -12,12 +12,23 @@ TUI -> LearningAgent -> AgentHarness -> Agent loop -> Provider
 当前边界：
 
 - 连接 OpenAI 或 Anthropic 的真实模型，不在运行时使用 Faux Provider。
-- 提供 `workspace_info`、`list_files`、`read_file`、`search_text` 四个只读工具。
+- 提供 `workspace_info`、`list_files`、`read_file`、`search_text` 四个工作区只读工具。
+- 提供 `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` 五个 Git 只读工具。
 - 提供 `propose_patch` 和 `apply_edit` 两个受控编辑工具。
 - 只能读取注入工作区内的有界元数据、目录结构和文本源码。
 - 工具执行支持 `AbortSignal` 和 `onUpdate`。
 - `beforeToolCall` 产生审计事件，`afterToolCall` 对结果脱敏。
 - 不提供 shell 或任意路径读写能力。
+
+Git 读取边界：
+
+- Git 命令通过注入的 operations 适配器执行，不读取全局 CWD，也不使用 shell。
+- 注入路径必须是包含本地 `.git` 目录的仓库根目录；为避免元数据逃逸，暂不支持 `.git` 文件形式的 linked worktree。
+- Git 目录内的链接和外部 object alternates 会被拒绝，命令行固定仓库目录与 worktree。
+- 路径必须是工作区相对路径；revision 拒绝选项注入和控制字符。
+- 每个工具调用的完整执行过程最长 15 秒；脱敏后最终返回给模型的文本不超过 64 KiB。
+- `git_diff`、`git_show` 的大 patch 会截断并明确标记；工具不会执行 checkout、add、commit、reset 或 push。
+- 所有 Git 工具同样经过 `beforeToolCall` 审计和 `afterToolCall` 脱敏。
 
 受控编辑流程：
 
@@ -93,6 +104,9 @@ TUI 命令：
 - `Ctrl+C`（输入为空时）或 `Ctrl+D`: 安全退出并恢复终端
 - 编辑审批期间按 `y`: 批准当前提案
 - 编辑审批期间按 `n` 或 `Esc`: 拒绝当前提案
+
+TUI 会在同一行更新工具的 `validating`、`running` 和完成状态，保留模型、Session、
+token 与 Context 状态栏信息；输入框支持 `↑`/`↓` 浏览历史并返回未提交草稿。
 
 Context 压缩说明：
 
