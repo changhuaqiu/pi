@@ -8,20 +8,25 @@ import {
 	createApplyEditTool,
 	createControlledEditManager,
 	createNodeControlledEditOperations,
+	createProposeCreateFileTool,
+	createProposeDeleteFileTool,
 	createProposePatchTool,
 } from "../src/controlled-edit-tools.ts";
 
 let workspaceRoot = "";
 let targetPath = "";
+let createdPath = "";
 
 before(async () => {
 	workspaceRoot = await mkdtemp(join(tmpdir(), "learning-agent-controlled-edit-"));
 	await mkdir(join(workspaceRoot, "apps", "learning-agent", "src"), { recursive: true });
 	targetPath = join(workspaceRoot, "apps", "learning-agent", "src", "app.ts");
+	createdPath = join(workspaceRoot, "apps", "learning-agent", "src", "created.ts");
 });
 
 beforeEach(async () => {
 	await writeFile(targetPath, "const answer = 41;\nexport { answer };\n");
+	await rm(createdPath, { force: true });
 });
 
 after(async () => {
@@ -58,7 +63,8 @@ test("proposal display neutralizes Unicode formatting controls", async () => {
 	const manager = createManager();
 	await writeFile(targetPath, 'const label = "safe\u202Eevil";\n');
 
-	const proposal = await manager.propose({
+	const proposal = await manager.prepare({
+		kind: "replace",
 		path: "apps/learning-agent/src/app.ts",
 		oldText: "safe\u202Eevil",
 		newText: "safe",
@@ -72,7 +78,8 @@ test("proposal display neutralizes Unicode formatting controls", async () => {
 
 test("apply_edit requires approval and applies an approved proposal atomically", async () => {
 	const manager = createManager();
-	await manager.propose({
+	await manager.prepare({
+		kind: "replace",
 		path: "apps/learning-agent/src/app.ts",
 		oldText: "41",
 		newText: "42",
@@ -93,9 +100,96 @@ test("apply_edit requires approval and applies an approved proposal atomically",
 	);
 });
 
+test("propose_create_file prepares an absent-path proposal and apply_edit creates it", async () => {
+	const manager = createManager();
+	const proposalResult = await createProposeCreateFileTool(manager).execute("create-proposal", {
+		path: "apps/learning-agent/src/created.ts",
+		content: "export const created = true;\n",
+		description: "Add a module",
+	});
+
+	assert.match(
+		proposalResult.content[0]?.type === "text" ? proposalResult.content[0].text : "",
+		/--- \/dev\/null/,
+	);
+	assert.equal(manager.getProposal("proposal-1").kind, "create");
+	await assert.rejects(readFile(createdPath, "utf8"), { code: "ENOENT" });
+
+	manager.approve("proposal-1");
+	const applied = await createApplyEditTool(manager).execute("apply-create", {
+		proposalId: "proposal-1",
+	});
+	assert.equal(applied.details.previousHash, undefined);
+	assert.equal(applied.details.newHash?.length, 64);
+	assert.equal(await readFile(createdPath, "utf8"), "export const created = true;\n");
+});
+
+test("create proposal refuses existing and concurrently created targets", async () => {
+	const manager = createManager();
+	await assert.rejects(
+		manager.prepare({
+			kind: "create",
+			path: "apps/learning-agent/src/app.ts",
+			content: "replacement\n",
+		}),
+		/already exists/,
+	);
+
+	await manager.prepare({
+		kind: "create",
+		path: "apps/learning-agent/src/created.ts",
+		content: "agent content\n",
+	});
+	manager.approve("proposal-1");
+	await writeFile(createdPath, "external content\n");
+	await assert.rejects(manager.apply("proposal-1"), /stale/);
+	assert.equal(await readFile(createdPath, "utf8"), "external content\n");
+});
+
+test("propose_delete_file deletes only the unchanged approved snapshot", async () => {
+	const manager = createManager();
+	const proposalResult = await createProposeDeleteFileTool(manager).execute("delete-proposal", {
+		path: "apps/learning-agent/src/app.ts",
+		description: "Remove obsolete module",
+	});
+	assert.match(
+		proposalResult.content[0]?.type === "text" ? proposalResult.content[0].text : "",
+		/\+\+\+ \/dev\/null/,
+	);
+	assert.equal(await readFile(targetPath, "utf8"), "const answer = 41;\nexport { answer };\n");
+
+	manager.approve("proposal-1");
+	const applied = await createApplyEditTool(manager).execute("apply-delete", {
+		proposalId: "proposal-1",
+	});
+	assert.equal(applied.details.previousHash?.length, 64);
+	assert.equal(applied.details.newHash, undefined);
+	await assert.rejects(readFile(targetPath, "utf8"), { code: "ENOENT" });
+});
+
+test("delete proposal rejects a file changed after preparation", async () => {
+	const manager = createManager();
+	await manager.prepare({
+		kind: "delete",
+		path: "apps/learning-agent/src/app.ts",
+	});
+	manager.approve("proposal-1");
+	await writeFile(targetPath, "new external content\n");
+
+	await assert.rejects(manager.apply("proposal-1"), /stale/);
+	assert.equal(await readFile(targetPath, "utf8"), "new external content\n");
+	assert.deepEqual(
+		(await readdir(join(workspaceRoot, "apps", "learning-agent", "src"))).filter((name) =>
+			name.endsWith(".delete"),
+		),
+		[],
+	);
+});
+
 test("apply_edit refuses a target locked by another Learning Agent writer", async () => {
 	const manager = createManager();
-	await manager.propose({
+	await manager.prepare({
+		kind: "replace",
 		path: "apps/learning-agent/src/app.ts",
 		oldText: "41",
 		newText: "42",
@@ -117,7 +211,8 @@ test("apply_edit refuses a target locked by another Learning Agent writer", asyn
 
 test("re-approval is idempotent when execution was delayed after approval", async () => {
 	const manager = createManager();
-	await manager.propose({
+	await manager.prepare({
+		kind: "replace",
 		path: "apps/learning-agent/src/app.ts",
 		oldText: "41",
 		newText: "42",
@@ -125,12 +220,13 @@ test("re-approval is idempotent when execution was delayed after approval", asyn
 
 	manager.approve("proposal-1");
 	manager.approve("proposal-1");
-	assert.equal((await manager.apply("proposal-1")).newHash.length, 64);
+	assert.equal((await manager.apply("proposal-1")).newHash?.length, 64);
 });
 
 test("apply_edit rejects a stale proposal without overwriting the newer file", async () => {
 	const manager = createManager();
-	await manager.propose({
+	await manager.prepare({
+		kind: "replace",
 		path: "apps/learning-agent/src/app.ts",
 		oldText: "41",
 		newText: "42",
@@ -147,7 +243,8 @@ test("propose_patch requires a unique exact match", async () => {
 	await writeFile(targetPath, "same\nsame\n");
 
 	await assert.rejects(
-		manager.propose({
+		manager.prepare({
+			kind: "replace",
 			path: "apps/learning-agent/src/app.ts",
 			oldText: "same",
 			newText: "different",
@@ -161,15 +258,26 @@ test("controlled edits reject paths outside apps/learning-agent", async () => {
 	await writeFile(join(workspaceRoot, "outside.ts"), "outside\n");
 
 	await assert.rejects(
-		manager.propose({ path: "outside.ts", oldText: "outside", newText: "changed" }),
+		manager.prepare({
+			kind: "replace",
+			path: "outside.ts",
+			oldText: "outside",
+			newText: "changed",
+		}),
 		/limited to apps\/learning-agent/,
 	);
 	await assert.rejects(
-		manager.propose({ path: "../outside.ts", oldText: "outside", newText: "changed" }),
+		manager.prepare({
+			kind: "replace",
+			path: "../outside.ts",
+			oldText: "outside",
+			newText: "changed",
+		}),
 		/traversal/,
 	);
 	await assert.rejects(
-		manager.propose({
+		manager.prepare({
+			kind: "replace",
 			path: "apps/learning-agent/src/app\u202Ets",
 			oldText: "41",
 			newText: "42",
@@ -194,7 +302,8 @@ test("controlled edits reject final symbolic links", async (context) => {
 	const manager = createManager();
 
 	await assert.rejects(
-		manager.propose({
+		manager.prepare({
+			kind: "replace",
 			path: "apps/learning-agent/src/linked.ts",
 			oldText: "outside",
 			newText: "changed",
@@ -205,7 +314,8 @@ test("controlled edits reject final symbolic links", async (context) => {
 
 test("aborting an approved edit leaves the target unchanged", async () => {
 	const manager = createManager();
-	await manager.propose({
+	await manager.prepare({
+		kind: "replace",
 		path: "apps/learning-agent/src/app.ts",
 		oldText: "41",
 		newText: "42",

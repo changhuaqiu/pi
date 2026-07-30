@@ -1,54 +1,95 @@
 import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { ControlledEditToolName } from "./controlled-edit-tools.ts";
-import type { GitToolName } from "./git-tools.ts";
-import type { ReadOnlyToolName } from "./read-only-tools.ts";
 
-export type LearningToolName =
-	| "workspace_info"
-	| ReadOnlyToolName
-	| ControlledEditToolName
-	| GitToolName;
-
-export interface ToolAuditRecord {
+export interface ToolDecisionAuditRecord {
+	phase: "decision";
 	toolCallId: string;
-	toolName: LearningToolName;
+	toolName: string;
 	decision: "allowed" | "blocked";
 	input: Record<string, unknown>;
 	timestamp: string;
 }
 
-const maxToolResultTextBytes = 64 * 1024;
-
-function hashAuditText(value: string): string {
-	return createHash("sha256").update(value, "utf8").digest("hex");
+export interface ToolResultAuditRecord {
+	phase: "result";
+	toolCallId: string;
+	toolName: string;
+	outcome: "completed" | "failed";
+	resultBytes: number;
+	durationMs?: number;
+	timestamp: string;
 }
 
-function createAuditInput(toolName: LearningToolName, input: Record<string, unknown>): Record<string, unknown> {
-	if (toolName !== "propose_patch") return structuredClone(input);
-	const oldText = typeof input.oldText === "string" ? input.oldText : "";
-	const newText = typeof input.newText === "string" ? input.newText : "";
+export type ToolAuditRecord = ToolDecisionAuditRecord | ToolResultAuditRecord;
+
+export const DEFAULT_MAX_TOOL_RESULT_BYTES = 64 * 1024;
+
+export interface AuditTextSummary {
+	bytes: number;
+	sha256: string;
+}
+
+export function summarizeAuditText(value: string): AuditTextSummary {
 	return {
-		path: input.path,
-		description: input.description,
-		oldTextBytes: Buffer.byteLength(oldText, "utf8"),
-		oldTextHash: hashAuditText(oldText),
-		newTextBytes: Buffer.byteLength(newText, "utf8"),
-		newTextHash: hashAuditText(newText),
+		bytes: Buffer.byteLength(value, "utf8"),
+		sha256: createHash("sha256").update(value, "utf8").digest("hex"),
 	};
 }
 
-export function createAuditRecord(
+export function sanitizeAuditInput(
+	input: Readonly<Record<string, unknown>>,
+	root: string,
+): Record<string, unknown> {
+	const seen = new WeakSet<object>();
+	const sanitize = (value: unknown, key?: string): unknown => {
+		if (key && /api[_-]?key|access[_-]?token|token|password|secret/i.test(key)) {
+			return "<redacted>";
+		}
+		if (typeof value === "string" && key && /^(?:content|oldText|newText)$/i.test(key)) {
+			return summarizeAuditText(value);
+		}
+		if (typeof value === "string") return redactText(value, root);
+		if (typeof value !== "object" || value === null) return value;
+		if (seen.has(value)) return "<circular>";
+		seen.add(value);
+		if (Array.isArray(value)) return value.map((entry) => sanitize(entry));
+		return Object.fromEntries(
+			Object.entries(value).map(([entryKey, entry]) => [entryKey, sanitize(entry, entryKey)]),
+		);
+	};
+	return sanitize(input) as Record<string, unknown>;
+}
+
+export function createDecisionAuditRecord(
 	toolCallId: string,
-	toolName: LearningToolName,
-	input: Record<string, unknown>,
-	decision: ToolAuditRecord["decision"],
-): ToolAuditRecord {
+	toolName: string,
+	inputSummary: Record<string, unknown>,
+	decision: ToolDecisionAuditRecord["decision"],
+): ToolDecisionAuditRecord {
 	return {
+		phase: "decision",
 		toolCallId,
 		toolName,
 		decision,
-		input: createAuditInput(toolName, input),
+		input: structuredClone(inputSummary),
+		timestamp: new Date().toISOString(),
+	};
+}
+
+export function createResultAuditRecord(
+	toolCallId: string,
+	toolName: string,
+	outcome: ToolResultAuditRecord["outcome"],
+	resultBytes: number,
+	durationMs?: number,
+): ToolResultAuditRecord {
+	return {
+		phase: "result",
+		toolCallId,
+		toolName,
+		outcome,
+		resultBytes,
+		...(durationMs === undefined ? {} : { durationMs }),
 		timestamp: new Date().toISOString(),
 	};
 }
@@ -80,11 +121,13 @@ function redactText(text: string, root: string): string {
 	return result.replace(/\bAKIA[0-9A-Z]{16}\b/g, "<redacted-key>");
 }
 
-function boundRedactedText(text: string): string {
+function boundRedactedText(text: string, maxBytes: number): string {
 	const suffix = "\n[tool result truncated after redaction]";
 	const buffer = Buffer.from(text, "utf8");
-	if (buffer.length <= maxToolResultTextBytes) return text;
-	const maxContentBytes = maxToolResultTextBytes - Buffer.byteLength(suffix, "utf8");
+	if (buffer.length <= maxBytes) return text;
+	const suffixBytes = Buffer.byteLength(suffix, "utf8");
+	if (maxBytes <= suffixBytes) return Buffer.from(suffix, "utf8").subarray(0, maxBytes).toString("utf8");
+	const maxContentBytes = maxBytes - suffixBytes;
 	let end = maxContentBytes;
 	while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1;
 	return `${buffer.subarray(0, end).toString("utf8")}${suffix}`;
@@ -106,17 +149,53 @@ function redactUnknown(value: unknown, root: string, seen: WeakSet<object>): unk
 	);
 }
 
+function jsonBytes(value: unknown): number {
+	if (value === undefined) return 0;
+	try {
+		return Buffer.byteLength(JSON.stringify(value), "utf8");
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
+function boundRedactedDetails(details: unknown, maxBytes: number): unknown {
+	if (jsonBytes(details) <= maxBytes) return details;
+	const marker = "<tool details truncated after redaction>";
+	return jsonBytes(marker) <= maxBytes ? marker : undefined;
+}
+
 export function redactToolResult(
 	content: AgentToolResult<unknown>["content"],
 	details: unknown,
 	root: string,
+	maxTextBytes = DEFAULT_MAX_TOOL_RESULT_BYTES,
 ): { content: AgentToolResult<unknown>["content"]; details: unknown } {
+	if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes <= 0) {
+		throw new Error("Tool result byte limit must be a positive safe integer");
+	}
+	let remainingBytes = maxTextBytes;
+	const governedContent: AgentToolResult<unknown>["content"] = [];
+	for (const item of content) {
+		if (remainingBytes <= 0) break;
+		if (item.type === "text") {
+			const text = boundRedactedText(redactText(item.text, root), remainingBytes);
+			governedContent.push({ ...item, text });
+			remainingBytes -= Buffer.byteLength(text, "utf8");
+			continue;
+		}
+		const imageBytes = Buffer.byteLength(item.data, "utf8");
+		if (imageBytes <= remainingBytes) {
+			governedContent.push(item);
+			remainingBytes -= imageBytes;
+			continue;
+		}
+		const text = boundRedactedText("[tool image omitted: result limit exceeded]", remainingBytes);
+		governedContent.push({ type: "text", text });
+		remainingBytes -= Buffer.byteLength(text, "utf8");
+	}
+	const redactedDetails = redactUnknown(details, root, new WeakSet());
 	return {
-		content: content.map((item) =>
-			item.type === "text"
-				? { ...item, text: boundRedactedText(redactText(item.text, root)) }
-				: item,
-		),
-		details: redactUnknown(details, root, new WeakSet()),
+		content: governedContent,
+		details: boundRedactedDetails(redactedDetails, remainingBytes),
 	};
 }

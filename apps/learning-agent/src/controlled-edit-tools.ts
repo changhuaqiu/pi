@@ -1,31 +1,39 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, open, realpath, rename, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { chmod, link, lstat, open, realpath, rename, rm, unlink } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
 import { normalizeRelativePath } from "./read-only-tools.ts";
 
-export type ControlledEditToolName = "propose_patch" | "apply_edit";
+export type EditKind = "replace" | "create" | "delete";
+export type ControlledEditToolName =
+	| "propose_patch"
+	| "propose_create_file"
+	| "propose_delete_file"
+	| "apply_edit";
 
 export interface EditProposalSummary {
 	id: string;
+	kind: EditKind;
 	path: string;
 	description?: string;
 	diff: string;
-	expectedHash: string;
+	expectedHash?: string;
 	expiresAt: string;
 }
 
 export interface AppliedEdit {
 	proposalId: string;
+	kind: EditKind;
 	path: string;
-	previousHash: string;
-	newHash: string;
+	previousHash?: string;
+	newHash?: string;
 }
 
-export interface EditableFileSnapshot {
+export interface ExistingEditableFileSnapshot {
+	state: "existing";
 	path: string;
 	resolvedPath: string;
 	content: string;
@@ -33,25 +41,45 @@ export interface EditableFileSnapshot {
 	mode: number;
 }
 
+export interface AbsentEditableFileSnapshot {
+	state: "absent";
+	path: string;
+	resolvedPath: string;
+	resolvedParent: string;
+}
+
+export type EditableFileSnapshot = ExistingEditableFileSnapshot | AbsentEditableFileSnapshot;
+
+export type PreparedEdit =
+	| { kind: "replace"; snapshot: ExistingEditableFileSnapshot; newContent: string }
+	| { kind: "create"; snapshot: AbsentEditableFileSnapshot; newContent: string }
+	| { kind: "delete"; snapshot: ExistingEditableFileSnapshot };
+
+export type EditIntent =
+	| {
+			kind: "replace";
+			path: string;
+			oldText: string;
+			newText: string;
+			description?: string;
+	  }
+	| { kind: "create"; path: string; content: string; description?: string }
+	| { kind: "delete"; path: string; description?: string };
+
 export interface ControlledEditOperations {
-	readEditableFile(path: string, signal?: AbortSignal): Promise<EditableFileSnapshot>;
+	inspectEditablePath(path: string, signal?: AbortSignal): Promise<EditableFileSnapshot>;
 	/**
-	 * Coordinates Learning Agent writers with an adjacent lock, rechecks the
-	 * snapshot immediately before commit, and atomically renames the new file.
-	 * External processes that ignore the lock can still race the final recheck.
+	 * Coordinates Learning Agent writers with an adjacent lock and rechecks the
+	 * expected existing/absent state immediately before committing the mutation.
 	 */
-	replaceIfUnchanged(
-		snapshot: EditableFileSnapshot,
-		newContent: string,
+	commitIfUnchanged(
+		edit: PreparedEdit,
 		signal?: AbortSignal,
-	): Promise<{ previousHash: string; newHash: string }>;
+	): Promise<{ previousHash?: string; newHash?: string }>;
 }
 
 export interface ControlledEditManager {
-	propose(
-		input: { path: string; oldText: string; newText: string; description?: string },
-		signal?: AbortSignal,
-	): Promise<EditProposalSummary>;
+	prepare(intent: EditIntent, signal?: AbortSignal): Promise<EditProposalSummary>;
 	getProposal(id: string): EditProposalSummary;
 	approve(id: string): void;
 	apply(id: string, signal?: AbortSignal): Promise<AppliedEdit>;
@@ -88,10 +116,43 @@ const proposePatchSchema = Type.Object(
 	{ additionalProperties: false },
 );
 
+const proposeCreateFileSchema = Type.Object(
+	{
+		path: Type.String({
+			description:
+				"New file under apps/learning-agent, relative to the workspace root; its parent directory must already exist",
+			minLength: 1,
+			maxLength: 500,
+		}),
+		content: Type.String({
+			description: "Complete UTF-8 text content for the new file",
+			maxLength: 64 * 1024,
+		}),
+		description: Type.Optional(
+			Type.String({ description: "Short reason for creating the file", minLength: 1, maxLength: 500 }),
+		),
+	},
+	{ additionalProperties: false },
+);
+
+const proposeDeleteFileSchema = Type.Object(
+	{
+		path: Type.String({
+			description: "Existing file under apps/learning-agent, relative to the workspace root",
+			minLength: 1,
+			maxLength: 500,
+		}),
+		description: Type.Optional(
+			Type.String({ description: "Short reason for deleting the file", minLength: 1, maxLength: 500 }),
+		),
+	},
+	{ additionalProperties: false },
+);
+
 const applyEditSchema = Type.Object(
 	{
 		proposalId: Type.String({
-			description: "Identifier returned by propose_patch",
+			description: "Identifier returned by a controlled edit proposal tool",
 			minLength: 1,
 			maxLength: 100,
 		}),
@@ -100,16 +161,19 @@ const applyEditSchema = Type.Object(
 );
 
 type ProposePatchInput = Static<typeof proposePatchSchema>;
+type ProposeCreateFileInput = Static<typeof proposeCreateFileSchema>;
+type ProposeDeleteFileInput = Static<typeof proposeDeleteFileSchema>;
 type ApplyEditInput = Static<typeof applyEditSchema>;
 
 interface StoredProposal {
 	summary: EditProposalSummary;
-	snapshot: EditableFileSnapshot;
-	newContent: string;
+	edit: PreparedEdit;
 	status: "pending" | "approved" | "applying" | "applied";
 }
 
 const proposePatchValidator = Compile(proposePatchSchema);
+const proposeCreateFileValidator = Compile(proposeCreateFileSchema);
+const proposeDeleteFileValidator = Compile(proposeDeleteFileSchema);
 const applyEditValidator = Compile(applyEditSchema);
 const editablePathPrefix = "apps/learning-agent/";
 const maxEditableFileBytes = 512 * 1024;
@@ -171,7 +235,7 @@ async function readTextFile(path: string, signal?: AbortSignal): Promise<{ conte
 
 export function createNodeControlledEditOperations(workspaceRoot: string): ControlledEditOperations {
 	return {
-		async readEditableFile(path, signal) {
+		async inspectEditablePath(path, signal) {
 			throwIfAborted(signal);
 			const normalized = normalizeEditablePath(path);
 			const lexicalWorkspace = resolve(workspaceRoot);
@@ -180,11 +244,29 @@ export function createNodeControlledEditOperations(workspaceRoot: string): Contr
 			if (!isWithinRoot(lexicalEditableRoot, lexicalTarget)) {
 				throw new Error("Editable path escapes apps/learning-agent");
 			}
-			const targetStats = await lstat(lexicalTarget);
-			throwIfAborted(signal);
-			if (targetStats.isSymbolicLink()) throw new Error("Symbolic links are not editable");
 			const resolvedEditableRoot = await realpath(lexicalEditableRoot);
 			throwIfAborted(signal);
+			const resolvedParent = await realpath(dirname(lexicalTarget));
+			throwIfAborted(signal);
+			if (!isWithinRoot(resolvedEditableRoot, resolvedParent)) {
+				throw new Error("Resolved editable parent escapes apps/learning-agent");
+			}
+			let targetStats;
+			try {
+				targetStats = await lstat(lexicalTarget);
+			} catch (error) {
+				if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+					return {
+						state: "absent",
+						path: normalized,
+						resolvedPath: join(resolvedParent, basename(lexicalTarget)),
+						resolvedParent,
+					};
+				}
+				throw error;
+			}
+			throwIfAborted(signal);
+			if (targetStats.isSymbolicLink()) throw new Error("Symbolic links are not editable");
 			const resolvedTarget = await realpath(lexicalTarget);
 			throwIfAborted(signal);
 			if (!isWithinRoot(resolvedEditableRoot, resolvedTarget)) {
@@ -192,6 +274,7 @@ export function createNodeControlledEditOperations(workspaceRoot: string): Contr
 			}
 			const file = await readTextFile(resolvedTarget, signal);
 			return {
+				state: "existing",
 				path: normalized,
 				resolvedPath: resolvedTarget,
 				content: file.content,
@@ -200,15 +283,21 @@ export function createNodeControlledEditOperations(workspaceRoot: string): Contr
 			};
 		},
 
-		async replaceIfUnchanged(snapshot, newContent, signal) {
+		async commitIfUnchanged(edit, signal) {
 			throwIfAborted(signal);
+			const snapshot = edit.snapshot;
 			const lockId = createHash("sha256").update(snapshot.resolvedPath).digest("hex").slice(0, 16);
 			const lockPath = join(dirname(snapshot.resolvedPath), `.learning-agent-edit-${lockId}.lock`);
 			let lockHandle: Awaited<ReturnType<typeof open>> | undefined;
 			try {
 				lockHandle = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
 				await lockHandle.writeFile(
-					JSON.stringify({ pid: process.pid, proposalHash: snapshot.hash, createdAt: new Date().toISOString() }),
+					JSON.stringify({
+						pid: process.pid,
+						kind: edit.kind,
+						proposalHash: snapshot.state === "existing" ? snapshot.hash : undefined,
+						createdAt: new Date().toISOString(),
+					}),
 					"utf8",
 				);
 				await lockHandle.sync();
@@ -225,35 +314,141 @@ export function createNodeControlledEditOperations(workspaceRoot: string): Contr
 			}
 
 			try {
-				const current = await this.readEditableFile(snapshot.path, signal);
-				if (current.resolvedPath !== snapshot.resolvedPath || current.hash !== snapshot.hash) {
+				const current = await this.inspectEditablePath(snapshot.path, signal);
+				if (edit.kind === "create") {
+					const createSnapshot = edit.snapshot;
+					if (
+						current.state !== "absent" ||
+						current.resolvedPath !== createSnapshot.resolvedPath
+					) {
+						throw new Error("Create proposal is stale because the target path now exists or moved");
+					}
+					if (Buffer.byteLength(edit.newContent, "utf8") > maxEditableFileBytes) {
+						throw new Error(`Created file exceeds ${maxEditableFileBytes} bytes`);
+					}
+					const temporaryPath = join(
+						createSnapshot.resolvedParent,
+						`.learning-agent-edit-${randomUUID()}.tmp`,
+					);
+					let temporaryCreated = false;
+					try {
+						const handle = await open(
+							temporaryPath,
+							constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+						);
+						temporaryCreated = true;
+						try {
+							await handle.writeFile(edit.newContent, "utf8");
+							await handle.sync();
+						} finally {
+							await handle.close();
+						}
+						const rechecked = await this.inspectEditablePath(createSnapshot.path, signal);
+						if (
+							rechecked.state !== "absent" ||
+							rechecked.resolvedPath !== createSnapshot.resolvedPath
+						) {
+							throw new Error("Create proposal became stale before commit");
+						}
+						throwIfAborted(signal);
+						try {
+							await link(temporaryPath, createSnapshot.resolvedPath);
+						} catch (error) {
+							if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+								throw new Error("Create proposal became stale before commit");
+							}
+							throw error;
+						}
+						return { newHash: hashText(edit.newContent) };
+					} finally {
+						if (temporaryCreated) await rm(temporaryPath, { force: true });
+					}
+				}
+				const existingSnapshot = edit.snapshot;
+				if (
+					current.state !== "existing" ||
+					current.resolvedPath !== existingSnapshot.resolvedPath
+				) {
 					throw new Error("Edit proposal is stale because the target file changed");
 				}
-				if (Buffer.byteLength(newContent, "utf8") > maxEditableFileBytes) {
+				if (edit.kind === "delete") {
+					const quarantinePath = join(
+						dirname(current.resolvedPath),
+						`.learning-agent-edit-${randomUUID()}.delete`,
+					);
+					let quarantined = false;
+					try {
+						throwIfAborted(signal);
+						await rename(current.resolvedPath, quarantinePath);
+						quarantined = true;
+						const captured = await readTextFile(quarantinePath, signal);
+						if (hashText(captured.content) !== existingSnapshot.hash) {
+							throw new Error("Delete proposal is stale because the target file changed");
+						}
+						throwIfAborted(signal);
+						await unlink(quarantinePath);
+						quarantined = false;
+						return { previousHash: existingSnapshot.hash };
+					} catch (error) {
+						if (quarantined) {
+							try {
+								await link(quarantinePath, current.resolvedPath);
+								await unlink(quarantinePath);
+								quarantined = false;
+							} catch {
+								// Preserve the quarantined file rather than overwrite a concurrently
+								// recreated target. The error below tells the user where to recover it.
+							}
+						}
+						if (quarantined) {
+							throw new Error(
+								`Delete was not committed; the captured file is preserved as ${JSON.stringify(basename(quarantinePath))}`,
+								{ cause: error },
+							);
+						}
+						throw error;
+					}
+				}
+				if (current.hash !== existingSnapshot.hash) {
+					throw new Error("Edit proposal is stale because the target file changed");
+				}
+				if (Buffer.byteLength(edit.newContent, "utf8") > maxEditableFileBytes) {
 					throw new Error(`Edited file exceeds ${maxEditableFileBytes} bytes`);
 				}
-
-				const temporaryPath = join(dirname(current.resolvedPath), `.learning-agent-edit-${randomUUID()}.tmp`);
+				const temporaryPath = join(
+					dirname(current.resolvedPath),
+					`.learning-agent-edit-${randomUUID()}.tmp`,
+				);
 				let temporaryCreated = false;
 				try {
-					const handle = await open(temporaryPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL);
+					const handle = await open(
+						temporaryPath,
+						constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+					);
 					temporaryCreated = true;
 					try {
-						await handle.writeFile(newContent, "utf8");
+						await handle.writeFile(edit.newContent, "utf8");
 						await handle.sync();
 					} finally {
 						await handle.close();
 					}
 					await chmod(temporaryPath, current.mode);
 					throwIfAborted(signal);
-					const rechecked = await this.readEditableFile(snapshot.path, signal);
-					if (rechecked.resolvedPath !== snapshot.resolvedPath || rechecked.hash !== snapshot.hash) {
+					const rechecked = await this.inspectEditablePath(existingSnapshot.path, signal);
+					if (
+						rechecked.state !== "existing" ||
+						rechecked.resolvedPath !== existingSnapshot.resolvedPath ||
+						rechecked.hash !== existingSnapshot.hash
+					) {
 						throw new Error("Edit proposal became stale before commit");
 					}
 					throwIfAborted(signal);
 					await rename(temporaryPath, current.resolvedPath);
 					temporaryCreated = false;
-					return { previousHash: snapshot.hash, newHash: hashText(newContent) };
+					return {
+						previousHash: existingSnapshot.hash,
+						newHash: hashText(edit.newContent),
+					};
 				} finally {
 					if (temporaryCreated) await rm(temporaryPath, { force: true });
 				}
@@ -316,6 +511,24 @@ function createDiff(path: string, content: string, oldText: string, newText: str
 	].join("\n");
 }
 
+function createWholeFileDiff(kind: "create" | "delete", path: string, content: string): string {
+	const lines = diffLines(content);
+	if (kind === "create") {
+		return [
+			"--- /dev/null",
+			`+++ b/${path}`,
+			`@@ -0,0 +1,${lines.length} @@`,
+			...lines.map((line) => `+${line}`),
+		].join("\n");
+	}
+	return [
+		`--- a/${path}`,
+		"+++ /dev/null",
+		`@@ -1,${lines.length} +0,0 @@`,
+		...lines.map((line) => `-${line}`),
+	].join("\n");
+}
+
 function sanitizeDescription(description: string | undefined): string | undefined {
 	const sanitized = description
 		?.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ")
@@ -354,21 +567,59 @@ export function createControlledEditManager(options: {
 	};
 
 	return {
-		async propose(input, signal) {
+		async prepare(intent, signal) {
 			throwIfAborted(signal);
-			if (Buffer.byteLength(input.oldText, "utf8") + Buffer.byteLength(input.newText, "utf8") > maxReplacementBytes) {
-				throw new Error(`Combined replacement exceeds ${maxReplacementBytes} bytes`);
-			}
-			if (input.oldText === input.newText) throw new Error("oldText and newText must differ");
-			const snapshot = await options.operations.readEditableFile(input.path, signal);
-			throwIfAborted(signal);
-			const occurrences = countOccurrences(snapshot.content, input.oldText);
-			if (occurrences !== 1) {
-				throw new Error(`oldText must occur exactly once in ${snapshot.path}; found ${occurrences}`);
-			}
-			const newContent = snapshot.content.replace(input.oldText, input.newText);
-			if (Buffer.byteLength(newContent, "utf8") > maxEditableFileBytes) {
-				throw new Error(`Edited file exceeds ${maxEditableFileBytes} bytes`);
+			const snapshot = await options.operations.inspectEditablePath(intent.path, signal);
+			let edit: PreparedEdit;
+			let diff: string;
+			if (intent.kind === "create") {
+				if (snapshot.state !== "absent") {
+					throw new Error(`Create target already exists: ${snapshot.path}`);
+				}
+				if (Buffer.byteLength(intent.content, "utf8") > maxReplacementBytes) {
+					throw new Error(`Created file content exceeds ${maxReplacementBytes} bytes`);
+				}
+				edit = { kind: "create", snapshot, newContent: intent.content };
+				diff = createWholeFileDiff("create", snapshot.path, intent.content);
+			} else {
+				if (snapshot.state !== "existing") {
+					throw new Error(`Existing file is required: ${snapshot.path}`);
+				}
+				if (intent.kind === "delete") {
+					if (Buffer.byteLength(snapshot.content, "utf8") > maxReplacementBytes) {
+						throw new Error(`Deleted file exceeds the ${maxReplacementBytes}-byte approval limit`);
+					}
+					edit = { kind: "delete", snapshot };
+					diff = createWholeFileDiff("delete", snapshot.path, snapshot.content);
+				} else {
+					if (
+						Buffer.byteLength(intent.oldText, "utf8") +
+							Buffer.byteLength(intent.newText, "utf8") >
+						maxReplacementBytes
+					) {
+						throw new Error(`Combined replacement exceeds ${maxReplacementBytes} bytes`);
+					}
+					if (intent.oldText === intent.newText) {
+						throw new Error("oldText and newText must differ");
+					}
+					const occurrences = countOccurrences(snapshot.content, intent.oldText);
+					if (occurrences !== 1) {
+						throw new Error(
+							`oldText must occur exactly once in ${snapshot.path}; found ${occurrences}`,
+						);
+					}
+					const newContent = snapshot.content.replace(intent.oldText, intent.newText);
+					if (Buffer.byteLength(newContent, "utf8") > maxEditableFileBytes) {
+						throw new Error(`Edited file exceeds ${maxEditableFileBytes} bytes`);
+					}
+					edit = { kind: "replace", snapshot, newContent };
+					diff = createDiff(
+						snapshot.path,
+						snapshot.content,
+						intent.oldText,
+						intent.newText,
+					);
+				}
 			}
 			while (proposals.size >= maxStoredProposals) {
 				const oldest = proposals.keys().next().value;
@@ -378,13 +629,14 @@ export function createControlledEditManager(options: {
 			const id = createId();
 			const summary: EditProposalSummary = {
 				id,
+				kind: edit.kind,
 				path: snapshot.path,
-				description: sanitizeDescription(input.description),
-				diff: sanitizeDiffForDisplay(createDiff(snapshot.path, snapshot.content, input.oldText, input.newText)),
-				expectedHash: snapshot.hash,
+				description: sanitizeDescription(intent.description),
+				diff: sanitizeDiffForDisplay(diff),
+				expectedHash: snapshot.state === "existing" ? snapshot.hash : undefined,
 				expiresAt: new Date(now().getTime() + proposalTtlMs).toISOString(),
 			};
-			proposals.set(id, { summary, snapshot, newContent, status: "pending" });
+			proposals.set(id, { summary, edit, status: "pending" });
 			return { ...summary };
 		},
 
@@ -408,14 +660,11 @@ export function createControlledEditManager(options: {
 			}
 			proposal.status = "applying";
 			try {
-				const result = await options.operations.replaceIfUnchanged(
-					proposal.snapshot,
-					proposal.newContent,
-					signal,
-				);
+				const result = await options.operations.commitIfUnchanged(proposal.edit, signal);
 				proposal.status = "applied";
 				return {
 					proposalId: id,
+					kind: proposal.summary.kind,
 					path: proposal.summary.path,
 					previousHash: result.previousHash,
 					newHash: result.newHash,
@@ -439,6 +688,39 @@ function emitUpdate(
 	throwIfAborted(signal);
 }
 
+function proposalResult(
+	proposal: EditProposalSummary,
+): AgentToolResult<ControlledEditToolDetails> {
+	return {
+		content: [
+			{
+				type: "text",
+				text: [
+					`${proposal.kind} proposal ${proposal.id} for ${JSON.stringify(proposal.path)}`,
+					proposal.description
+						? `Description: ${JSON.stringify(proposal.description)}`
+						: undefined,
+					proposal.expectedHash
+						? `Expected SHA-256: ${proposal.expectedHash}`
+						: "Expected state: path does not exist",
+					`Expires: ${proposal.expiresAt}`,
+					"",
+					proposal.diff,
+					"",
+					`Call apply_edit with proposalId ${JSON.stringify(proposal.id)} to request user approval.`,
+				]
+					.filter((line): line is string => line !== undefined)
+					.join("\n"),
+			},
+		],
+		details: {
+			stage: "awaiting_approval",
+			path: proposal.path,
+			proposalId: proposal.id,
+		},
+	};
+}
+
 export function createProposePatchTool(
 	manager: ControlledEditManager,
 ): AgentTool<typeof proposePatchSchema, ControlledEditToolDetails> {
@@ -456,32 +738,77 @@ export function createProposePatchTool(
 			const input: ProposePatchInput = rawInput;
 			emitUpdate("propose_patch", onUpdate, { stage: "validating", path: input.path }, signal);
 			emitUpdate("propose_patch", onUpdate, { stage: "preparing", path: input.path }, signal);
-			const proposal = await manager.propose(input, signal);
+			const proposal = await manager.prepare({ kind: "replace", ...input }, signal);
 			throwIfAborted(signal);
-			return {
-				content: [
-					{
-						type: "text",
-						text: [
-							`Edit proposal ${proposal.id} for ${JSON.stringify(proposal.path)}`,
-							proposal.description ? `Description: ${JSON.stringify(proposal.description)}` : undefined,
-							`Expected SHA-256: ${proposal.expectedHash}`,
-							`Expires: ${proposal.expiresAt}`,
-							"",
-							proposal.diff,
-							"",
-							`Call apply_edit with proposalId ${JSON.stringify(proposal.id)} to request user approval.`,
-						]
-							.filter((line): line is string => line !== undefined)
-							.join("\n"),
-					},
-				],
-				details: {
-					stage: "awaiting_approval",
-					path: proposal.path,
-					proposalId: proposal.id,
-				},
-			} satisfies AgentToolResult<ControlledEditToolDetails>;
+			return proposalResult(proposal);
+		},
+	};
+}
+
+export function createProposeCreateFileTool(
+	manager: ControlledEditManager,
+): AgentTool<typeof proposeCreateFileSchema, ControlledEditToolDetails> {
+	return {
+		name: "propose_create_file",
+		label: "propose create file",
+		description:
+			"Prepare creation of one new UTF-8 text file under apps/learning-agent. The parent directory must exist and the path must remain absent until apply_edit is approved.",
+		parameters: proposeCreateFileSchema,
+		executionMode: "sequential",
+		async execute(_toolCallId, rawInput, signal, onUpdate) {
+			if (!proposeCreateFileValidator.Check(rawInput)) {
+				throw new Error("propose_create_file arguments failed execution-time validation");
+			}
+			const input: ProposeCreateFileInput = rawInput;
+			emitUpdate(
+				"propose_create_file",
+				onUpdate,
+				{ stage: "validating", path: input.path },
+				signal,
+			);
+			emitUpdate(
+				"propose_create_file",
+				onUpdate,
+				{ stage: "preparing", path: input.path },
+				signal,
+			);
+			const proposal = await manager.prepare({ kind: "create", ...input }, signal);
+			throwIfAborted(signal);
+			return proposalResult(proposal);
+		},
+	};
+}
+
+export function createProposeDeleteFileTool(
+	manager: ControlledEditManager,
+): AgentTool<typeof proposeDeleteFileSchema, ControlledEditToolDetails> {
+	return {
+		name: "propose_delete_file",
+		label: "propose delete file",
+		description:
+			"Prepare deletion of one existing UTF-8 text file under apps/learning-agent. apply_edit rejects the proposal if the file changes before approval.",
+		parameters: proposeDeleteFileSchema,
+		executionMode: "sequential",
+		async execute(_toolCallId, rawInput, signal, onUpdate) {
+			if (!proposeDeleteFileValidator.Check(rawInput)) {
+				throw new Error("propose_delete_file arguments failed execution-time validation");
+			}
+			const input: ProposeDeleteFileInput = rawInput;
+			emitUpdate(
+				"propose_delete_file",
+				onUpdate,
+				{ stage: "validating", path: input.path },
+				signal,
+			);
+			emitUpdate(
+				"propose_delete_file",
+				onUpdate,
+				{ stage: "preparing", path: input.path },
+				signal,
+			);
+			const proposal = await manager.prepare({ kind: "delete", ...input }, signal);
+			throwIfAborted(signal);
+			return proposalResult(proposal);
 		},
 	};
 }
@@ -514,11 +841,15 @@ export function createApplyEditTool(
 					{
 						type: "text",
 						text: [
-							`Applied edit proposal ${applied.proposalId} to ${JSON.stringify(applied.path)}.`,
-							`Previous SHA-256: ${applied.previousHash}`,
-							`New SHA-256: ${applied.newHash}`,
+							`Applied ${applied.kind} proposal ${applied.proposalId} to ${JSON.stringify(applied.path)}.`,
+							applied.previousHash
+								? `Previous SHA-256: ${applied.previousHash}`
+								: undefined,
+							applied.newHash ? `New SHA-256: ${applied.newHash}` : undefined,
 							"The running process still uses the previously loaded code; restart Learning Agent to load this change.",
-						].join("\n"),
+						]
+							.filter((line): line is string => line !== undefined)
+							.join("\n"),
 					},
 				],
 				details: {

@@ -5,6 +5,7 @@ import { EditApprovalCoordinator, type EditApprovalRequest } from "../src/edit-a
 
 const proposal: EditProposalSummary = {
 	id: "proposal-1",
+	kind: "replace",
 	path: "apps/learning-agent/src/app.ts",
 	description: "Test edit",
 	diff: "--- a/app.ts\n+++ b/app.ts",

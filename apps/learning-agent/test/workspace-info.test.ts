@@ -6,7 +6,7 @@ import {
 	type WorkspaceInfoOperations,
 } from "../src/workspace-info.ts";
 import { redactToolResult } from "../src/tool-security.ts";
-import { createAuditRecord } from "../src/tool-security.ts";
+import { summarizeCreateInput, summarizePatchInput } from "../src/learning-tools.ts";
 
 const operations: WorkspaceInfoOperations = {
 	async listEntries() {
@@ -115,37 +115,29 @@ test("redaction keeps final model-facing text within the shared UTF-8 limit", ()
 });
 
 test("propose_patch audit records hashes instead of source text", () => {
-	const record = createAuditRecord(
-		"call-4",
-		"propose_patch",
-		{
-			path: "apps/learning-agent/src/app.ts",
-			oldText: "private old source",
-			newText: "private new source",
-			description: "change",
-		},
-		"allowed",
-	);
+	const input = summarizePatchInput({
+		path: "apps/learning-agent/src/app.ts",
+		oldText: "private old source",
+		newText: "private new source",
+		description: "change",
+	});
 
-	assert.equal(record.input.path, "apps/learning-agent/src/app.ts");
-	assert.equal(record.input.oldTextBytes, 18);
-	assert.equal(record.input.newTextBytes, 18);
-	assert.equal("oldText" in record.input, false);
-	assert.equal("newText" in record.input, false);
+	assert.equal(input.path, "apps/learning-agent/src/app.ts");
+	assert.equal(input.oldTextBytes, 18);
+	assert.equal(input.newTextBytes, 18);
+	assert.equal("oldText" in input, false);
+	assert.equal("newText" in input, false);
 });
 
-test("Git tool calls use the shared audit record", () => {
-	const record = createAuditRecord(
-		"call-5",
-		"git_diff",
-		{ from: "HEAD~1", to: "HEAD", path: "apps/learning-agent" },
-		"allowed",
-	);
-
-	assert.equal(record.toolName, "git_diff");
-	assert.deepEqual(record.input, {
-		from: "HEAD~1",
-		to: "HEAD",
-		path: "apps/learning-agent",
+test("propose_create_file audit records a hash instead of file content", () => {
+	const input = summarizeCreateInput({
+		path: "apps/learning-agent/src/new.ts",
+		content: "private new file content",
+		description: "new module",
 	});
+
+	assert.equal(input.path, "apps/learning-agent/src/new.ts");
+	assert.equal(input.contentBytes, 24);
+	assert.equal(typeof input.contentHash, "string");
+	assert.equal("content" in input, false);
 });
