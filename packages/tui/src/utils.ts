@@ -622,6 +622,13 @@ function updateTrackerFromText(text: string, tracker: AnsiCodeTracker): void {
 	}
 }
 
+/** Close styling and any active OSC 8 hyperlink before adjacent terminal content. */
+export function terminateAnsiState(text: string): string {
+	const tracker = new AnsiCodeTracker();
+	updateTrackerFromText(text, tracker);
+	return `${text}\x1b[0m${tracker.getLineEndReset()}`;
+}
+
 /**
  * Split text into words while keeping ANSI codes attached.
  */

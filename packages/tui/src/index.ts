@@ -12,10 +12,22 @@ export {
 export { Box } from "./components/box.ts";
 export { CancellableLoader } from "./components/cancellable-loader.ts";
 export { Editor, type EditorOptions, type EditorTheme } from "./components/editor.ts";
+export {
+	HorizontalLayout,
+	type HorizontalLayoutOptions,
+	type HorizontalLayoutSegment,
+	type HorizontalLayoutWidth,
+} from "./components/horizontal-layout.ts";
 export { Image, type ImageOptions, type ImageTheme } from "./components/image.ts";
 export { Input } from "./components/input.ts";
 export { Loader, type LoaderIndicatorOptions } from "./components/loader.ts";
 export { type DefaultTextStyle, Markdown, type MarkdownOptions, type MarkdownTheme } from "./components/markdown.ts";
+export {
+	type ScrollPageSize,
+	ScrollView,
+	type ScrollViewOptions,
+	type ScrollViewTheme,
+} from "./components/scroll-view.ts";
 export {
 	type SelectItem,
 	SelectList,

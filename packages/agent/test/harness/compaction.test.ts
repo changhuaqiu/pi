@@ -1,5 +1,6 @@
 import {
 	type AssistantMessage,
+	createAssistantMessageEventStream,
 	createModels,
 	type FauxProviderHandle,
 	fauxAssistantMessage,
@@ -11,6 +12,8 @@ import {
 } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+	type CompactedToolCall,
+	type CompactionDetails,
 	type CompactionPreparation,
 	calculateContextTokens,
 	compact,
@@ -26,7 +29,8 @@ import {
 	serializeConversation,
 	shouldCompact,
 } from "../../src/harness/compaction/compaction.ts";
-import { buildSessionContext } from "../../src/harness/session/session.ts";
+import { InMemorySessionStorage } from "../../src/harness/session/memory-storage.ts";
+import { buildSessionContext, Session } from "../../src/harness/session/session.ts";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
@@ -146,13 +150,19 @@ function createFauxModel(reasoning: boolean, maxTokens = 8192): { faux: FauxProv
 	return { faux, model: faux.getModel() };
 }
 
-function createModelsWithSimpleResponses(responses: AssistantMessage[]): Models {
+function createModelsWithStreamingResponses(responses: AssistantMessage[]): Models {
 	const remaining = [...responses];
 	const stub = Object.create(models) as Models;
-	stub.completeSimple = async () => {
+	stub.streamSimple = () => {
 		const response = remaining.shift();
-		if (!response) throw new Error("No faux completeSimple response queued");
-		return response;
+		if (!response) throw new Error("No faux streamSimple response queued");
+		const stream = createAssistantMessageEventStream();
+		if (response.stopReason === "error" || response.stopReason === "aborted") {
+			stream.push({ type: "error", reason: response.stopReason, error: response });
+		} else {
+			stream.push({ type: "done", reason: response.stopReason, message: response });
+		}
+		return stream;
 	};
 	return stub;
 }
@@ -394,13 +404,18 @@ describe("harness compaction", () => {
 		const a1 = createMessageEntry(createAssistantMessage("assistant msg 1"), u1.id);
 		const u2 = createMessageEntry(createUserMessage("user msg 2"), a1.id);
 		const a2 = createMessageEntry(createAssistantMessage("assistant msg 2", createMockUsage(5000, 1000)), u2.id);
-		const compaction1 = createCompactionEntry("First summary", u2.id, a2.id);
+		const compaction1 = createCompactionEntry(
+			"## Goal\nLegacy goal\n\n## Constraints & Preferences\n- Keep this constraint\n\n## Progress\n### Done\n- old work",
+			u2.id,
+			a2.id,
+		);
 		const u3 = createMessageEntry(createUserMessage("user msg 3"), compaction1.id);
 		const a3 = createMessageEntry(createAssistantMessage("assistant msg 3", createMockUsage(8000, 2000)), u3.id);
 		const pathEntries = [u1, a1, u2, a2, compaction1, u3, a3];
 		const preparation = getOrThrow(prepareCompaction(pathEntries, DEFAULT_COMPACTION_SETTINGS));
 		expect(preparation).toBeDefined();
-		expect(preparation?.previousSummary).toBe("First summary");
+		expect(preparation?.previousSummary).toBeUndefined();
+		expect(preparation?.legacySummaryQuarantined).toBe(true);
 		expect(preparation?.firstKeptEntryId).toBeTruthy();
 		expect(preparation?.retainedTail.length).toBeGreaterThan(0);
 		expect(preparation?.tokensBefore).toBe(estimateContextTokens(buildSessionContext(pathEntries).messages).tokens);
@@ -415,7 +430,11 @@ describe("harness compaction", () => {
 		const a1 = createMessageEntry(assistantMessage, u1.id);
 		const compaction1: CompactionEntry = {
 			...createCompactionEntry("First summary", u1.id, a1.id),
-			details: { readFiles: ["old-read.ts"], modifiedFiles: ["old-edit.ts"] },
+			details: {
+				formatVersion: 2,
+				readFiles: ["old-read.ts"],
+				modifiedFiles: ["old-edit.ts"],
+			},
 		};
 		const u2 = createMessageEntry(createUserMessage("large turn"), compaction1.id);
 		const a2 = createMessageEntry(createAssistantMessage("large assistant message"), u2.id);
@@ -432,6 +451,96 @@ describe("harness compaction", () => {
 		expect([...preparation!.fileOps.read]).toContain("old-read.ts");
 		expect([...preparation!.fileOps.edited]).toContain("old-edit.ts");
 		expect([...preparation!.fileOps.written]).toContain("written.ts");
+		expect(preparation?.userIntentHistory).toEqual(["user msg 1", "large turn"]);
+		expect(preparation?.toolCallHistory).toEqual([
+			{
+				sequence: 1,
+				id: "tool-1",
+				name: "write",
+				arguments: '{"path":"written.ts"}',
+				status: "unknown",
+				outputDisposition: "not_present",
+			},
+		]);
+	});
+
+	it("migrates legacy intent without sending the legacy summary back to the model", async () => {
+		const legacyOutput = "LEGACY_TOOL_OUTPUT_MUST_NOT_REENTER";
+		const legacyCompaction = createCompactionEntry(
+			`## Goal\nPreserve the legacy goal\n\n## Constraints & Preferences\n- Keep legacy constraint\n\n## Progress\n### Done\n- ${legacyOutput}`,
+			"old-kept",
+			null,
+			[],
+		);
+		const user = createMessageEntry(createUserMessage("Continue"), legacyCompaction.id);
+		const assistant = createMessageEntry(createAssistantMessage("Continuing"), user.id);
+		const preparation = getOrThrow(
+			prepareCompaction([legacyCompaction, user, assistant], {
+				enabled: true,
+				reserveTokens: 2000,
+				keepRecentTokens: 20000,
+			}),
+		);
+		expect(preparation?.previousSummary).toBeUndefined();
+		const { faux, model } = createFauxModel(false);
+		let promptText = "";
+		faux.setResponses([
+			(context) => {
+				const message = context.messages[0];
+				const content = message?.role === "user" ? message.content : [];
+				promptText = Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "";
+				return fauxAssistantMessage("## Execution Checkpoint\n### In Progress\n- continuing");
+			},
+		]);
+
+		const result = getOrThrow(await compact(preparation!, models, model));
+
+		expect(promptText).not.toContain(legacyOutput);
+		expect(result.summary).not.toContain(legacyOutput);
+		expect(result.summary).not.toContain("Preserve the legacy goal");
+		expect(result.summary).not.toContain("Keep legacy constraint");
+		expect(result.summary).toContain("A legacy model-generated summary was withheld");
+		expect((result.details as CompactionDetails).legacySummaryQuarantined).toBe(true);
+	});
+
+	it("removes outputs from tool results retained after the compaction cut", () => {
+		const user = createMessageEntry(createUserMessage("Read the file"));
+		const assistant = createMessageEntry(
+			{
+				...createAssistantMessage("Reading"),
+				content: [{ type: "toolCall", id: "recent-call", name: "read", arguments: { path: "recent.ts" } }],
+			},
+			user.id,
+		);
+		const result = createMessageEntry(
+			{
+				role: "toolResult",
+				toolCallId: "recent-call",
+				toolName: "read",
+				content: [{ type: "text", text: "RECENT_SECRET_OUTPUT" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			assistant.id,
+		);
+		const preparation = getOrThrow(
+			prepareCompaction([user, assistant, result], {
+				enabled: true,
+				reserveTokens: 2000,
+				keepRecentTokens: 20000,
+			}),
+		);
+
+		const retainedResult = preparation?.retainedTail.find((message) => message.role === "toolResult");
+		expect(retainedResult?.role).toBe("toolResult");
+		if (retainedResult?.role === "toolResult") {
+			expect(retainedResult.content).toEqual([
+				{
+					type: "text",
+					text: "[Tool output removed during compaction] tool=read id=recent-call status=success disposition=removed",
+				},
+			]);
+		}
 	});
 
 	it("prepares custom and branch summary entries for summarization", () => {
@@ -553,6 +662,55 @@ describe("harness compaction", () => {
 		expect(promptText).toContain("Additional focus: focus");
 	});
 
+	it("removes tool outputs before asking the summary model", async () => {
+		const secretOutput = "SECRET_TOOL_OUTPUT";
+		const secretBashOutput = "SECRET_BASH_OUTPUT";
+		const assistant: AssistantMessage = {
+			...createAssistantMessage("calling read"),
+			content: [{ type: "toolCall", id: "call-read", name: "read", arguments: { path: "src/index.ts" } }],
+		};
+		const messages: AgentMessage[] = [
+			createUserMessage("Inspect the file"),
+			assistant,
+			{
+				role: "toolResult",
+				toolCallId: "call-read",
+				toolName: "read",
+				content: [{ type: "text", text: secretOutput }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			{
+				role: "bashExecution",
+				command: "npm run check",
+				output: secretBashOutput,
+				exitCode: 0,
+				cancelled: false,
+				truncated: true,
+				fullOutputPath: "C:/secret/full-output.txt",
+				timestamp: Date.now(),
+			},
+		];
+		let promptText = "";
+		const { faux, model } = createFauxModel(false);
+		faux.setResponses([
+			(context) => {
+				const message = context.messages[0];
+				const content = message?.role === "user" ? message.content : [];
+				promptText = Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "";
+				return fauxAssistantMessage("## Execution Checkpoint\nNo output retained");
+			},
+		]);
+
+		getOrThrow(await generateSummaryWithUsage(messages, models, model, 2000));
+
+		expect(promptText).not.toContain(secretOutput);
+		expect(promptText).not.toContain(secretBashOutput);
+		expect(promptText).not.toContain("C:/secret/full-output.txt");
+		expect(promptText).toContain("[Tool output removed during compaction]");
+		expect(promptText).toContain("tool=read id=call-read status=success disposition=removed");
+	});
+
 	it("preserves the string result from generateSummary", async () => {
 		const messages: AgentMessage[] = [createUserMessage("Summarize this.")];
 		const { faux, model } = createFauxModel(false);
@@ -640,7 +798,7 @@ describe("harness compaction", () => {
 		const { model } = createFauxModel(false);
 		const historyUsage = createMockUsage(1, 2, 3, 4);
 		const turnPrefixUsage = createMockUsage(5, 6, 7, 8);
-		const usageModels = createModelsWithSimpleResponses([
+		const usageModels = createModelsWithStreamingResponses([
 			{ ...fauxAssistantMessage("history summary"), usage: historyUsage },
 			{ ...fauxAssistantMessage("turn prefix summary"), usage: turnPrefixUsage },
 		]);
@@ -733,6 +891,247 @@ describe("harness compaction", () => {
 		expect(result.usage?.totalTokens).toBeGreaterThan(0);
 		expect(result.retainedTail?.length).toBeGreaterThan(0);
 		expect(result.details).toBeDefined();
+	});
+
+	it("retains exact user intent and tool-call records without tool output after compaction", async () => {
+		const secretOutput = "SECRET_RESULT_".repeat(100);
+		const initialRequest = createMessageEntry(createUserMessage("Inspect src/index.ts without editing it"));
+		const assistantWithCall = createMessageEntry(
+			{
+				...createAssistantMessage("I will inspect it"),
+				content: [{ type: "toolCall", id: "call-read", name: "read", arguments: { path: "src/index.ts" } }],
+			},
+			initialRequest.id,
+		);
+		const toolResult = createMessageEntry(
+			{
+				role: "toolResult",
+				toolCallId: "call-read",
+				toolName: "read",
+				content: [{ type: "text", text: secretOutput }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			assistantWithCall.id,
+		);
+		const correction = createMessageEntry(createUserMessage("Actually, only report the filename"), toolResult.id);
+		const finalAssistant = createMessageEntry(createAssistantMessage("src/index.ts"), correction.id);
+		const preparation = getOrThrow(
+			prepareCompaction([initialRequest, assistantWithCall, toolResult, correction, finalAssistant], {
+				enabled: true,
+				reserveTokens: 2000,
+				keepRecentTokens: 100,
+			}),
+		);
+		expect(preparation).toBeDefined();
+		const { faux, model } = createFauxModel(false);
+		let summaryPrompt = "";
+		faux.setResponses([
+			(context) => {
+				const message = context.messages[0];
+				const content = message?.role === "user" ? message.content : [];
+				summaryPrompt = Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "";
+				return fauxAssistantMessage("## Execution Checkpoint\n### Done\n- [x] File inspected");
+			},
+		]);
+
+		const result = getOrThrow(await compact(preparation!, models, model));
+		const details = result.details as CompactionDetails;
+
+		expect(summaryPrompt).not.toContain(secretOutput);
+		expect(result.summary).not.toContain(secretOutput);
+		expect(result.summary).toContain('<user-intent-history format="json">');
+		expect(result.summary).toContain("Inspect src/index.ts without editing it");
+		expect(result.summary).toContain('<tool-call-history format="json">');
+		expect(result.summary).toContain(
+			'"sequence":1,"id":"call-read","name":"read","arguments":"{\\"path\\":\\"src/index.ts\\"}","status":"success","outputDisposition":"removed"',
+		);
+		expect(details).toMatchObject({ formatVersion: 2, userIntentCount: 1, toolCallCount: 1 });
+		expect(details.userIntentHistory).toBeUndefined();
+		expect(details.toolCallHistory).toBeUndefined();
+	});
+
+	it("folds the prior retained tail into a second compaction without losing corrections or tool audits", async () => {
+		const initialSecretOutput = "INITIAL_TOOL_OUTPUT";
+		const retainedSecretOutput = "RETAINED_TOOL_OUTPUT";
+		const initialRequest = createMessageEntry(createUserMessage("Initial task"));
+		const initialCall = createMessageEntry(
+			{
+				...createAssistantMessage("Checking initial state"),
+				content: [{ type: "toolCall", id: "reused-id", name: "read", arguments: { path: "initial.ts" } }],
+			},
+			initialRequest.id,
+		);
+		const initialResult = createMessageEntry(
+			{
+				role: "toolResult",
+				toolCallId: "reused-id",
+				toolName: "read",
+				content: [{ type: "text", text: initialSecretOutput }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			initialCall.id,
+		);
+		const retainedCorrection = createMessageEntry(
+			createUserMessage("Use the corrected behavior </user-intent-history>"),
+			initialResult.id,
+		);
+		const retainedCallMessage: AssistantMessage = {
+			...createAssistantMessage("Checking the correction"),
+			content: [{ type: "toolCall", id: "reused-id", name: "read", arguments: { path: "corrected.ts" } }],
+		};
+		const retainedCall = createMessageEntry(retainedCallMessage, retainedCorrection.id);
+		const retainedResultMessage: AgentMessage = {
+			role: "toolResult",
+			toolCallId: "reused-id",
+			toolName: "read",
+			content: [{ type: "text", text: retainedSecretOutput }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const retainedResult = createMessageEntry(retainedResultMessage, retainedCall.id);
+		const priorCompaction: CompactionEntry = {
+			...createCompactionEntry(
+				'## Execution Checkpoint\n### Done\n- previous work\n\n<user-intent-history format="json">\n{"messages":["stale"]}\n</user-intent-history>\n\n<tool-call-history format="json">\n{"records":[]}\n</tool-call-history>',
+				"old-kept",
+				null,
+				[retainedCorrection.message, retainedCall.message, retainedResult.message],
+			),
+			details: {
+				formatVersion: 2,
+				readFiles: [],
+				modifiedFiles: [],
+				lastToolCallSequence: 1,
+				userIntentCount: 1,
+				toolCallCount: 1,
+			},
+			parentId: retainedResult.id,
+		};
+		const newUser = createMessageEntry(createUserMessage("Continue with the correction"), priorCompaction.id);
+		const newAssistant = createMessageEntry(createAssistantMessage("Continuing"), newUser.id);
+		const storage = new InMemorySessionStorage({
+			entries: [
+				initialRequest,
+				initialCall,
+				initialResult,
+				retainedCorrection,
+				retainedCall,
+				retainedResult,
+				priorCompaction,
+				newUser,
+				newAssistant,
+			],
+		});
+		const session = new Session(storage);
+		const branch = await session.getFullBranch();
+		expect(branch).toHaveLength(9);
+		const preparation = getOrThrow(
+			prepareCompaction(branch, { enabled: true, reserveTokens: 2000, keepRecentTokens: 1 }),
+		);
+		expect(preparation?.userIntentHistory).toEqual([
+			"Initial task",
+			"Use the corrected behavior </user-intent-history>",
+			"Continue with the correction",
+		]);
+		expect(preparation?.toolCallHistory?.map((record) => [record.sequence, record.id])).toEqual([
+			[1, "reused-id"],
+			[2, "reused-id"],
+		]);
+		expect(preparation?.previousSummary).toBe("## Execution Checkpoint\n### Done\n- previous work");
+
+		const prompts: string[] = [];
+		const { faux, model } = createFauxModel(false);
+		faux.setResponses([
+			(context) => {
+				const message = context.messages[0];
+				const content = message?.role === "user" ? message.content : [];
+				prompts.push(Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "");
+				return fauxAssistantMessage("## Execution Checkpoint\n### Done\n- retained tail folded");
+			},
+			(context) => {
+				const message = context.messages[0];
+				const content = message?.role === "user" ? message.content : [];
+				prompts.push(Array.isArray(content) && content[0]?.type === "text" ? content[0].text : "");
+				return fauxAssistantMessage("## Early Progress\n- correction queued");
+			},
+		]);
+		const secondResult = getOrThrow(await compact(preparation!, models, model));
+		expect(prompts.join("\n")).not.toContain(initialSecretOutput);
+		expect(prompts.join("\n")).not.toContain(retainedSecretOutput);
+		expect(secondResult.summary).not.toContain('</user-intent-history>"');
+		expect(secondResult.summary).toContain("\\u003c/user-intent-history\\u003e");
+		await session.appendCompaction(
+			secondResult.summary,
+			secondResult.firstKeptEntryId,
+			secondResult.tokensBefore,
+			secondResult.details,
+			false,
+			secondResult.usage,
+			secondResult.retainedTail,
+		);
+		const context = await session.buildContext();
+		const contextText = JSON.stringify(context.messages);
+		expect(contextText).not.toContain(initialSecretOutput);
+		expect(contextText).not.toContain(retainedSecretOutput);
+		expect(contextText).toContain("Use the corrected behavior");
+		const compactedContext = context.messages[0];
+		expect(compactedContext?.role).toBe("compactionSummary");
+		if (compactedContext?.role === "compactionSummary") {
+			expect(compactedContext.summary).toContain('"sequence":2');
+		}
+		expect(secondResult.details as CompactionDetails).toMatchObject({
+			formatVersion: 2,
+			userIntentCount: 3,
+			toolCallCount: 2,
+		});
+		expect((secondResult.details as CompactionDetails).userIntentHistory).toBeUndefined();
+		expect((secondResult.details as CompactionDetails).toolCallHistory).toBeUndefined();
+	});
+
+	it("bounds deterministic intent and tool histories while reporting omitted records", async () => {
+		const userIntentHistory = Array.from({ length: 80 }, (_, index) => `user-${index}-${"u".repeat(2000)}`);
+		userIntentHistory[userIntentHistory.length - 1] = `LATEST_HEAD_${"z".repeat(70000)}_LATEST_TAIL`;
+		const toolCallHistory = Array.from(
+			{ length: 80 },
+			(_, index): CompactedToolCall => ({
+				sequence: index + 1,
+				id: `call-${index}`,
+				name: "read",
+				arguments: JSON.stringify({ value: "a".repeat(1000) }),
+				status: "success",
+				outputDisposition: "removed",
+			}),
+		);
+		const preparation: CompactionPreparation = {
+			firstKeptEntryId: "entry-keep",
+			messagesToSummarize: [createUserMessage("summarize")],
+			turnPrefixMessages: [],
+			retainedTail: [],
+			isSplitTurn: false,
+			tokensBefore: 200000,
+			userIntentHistory,
+			toolCallHistory,
+			lastToolCallSequence: 80,
+			fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
+		};
+		const { faux, model } = createFauxModel(false);
+		faux.setResponses([fauxAssistantMessage("## Execution Checkpoint\n### Done\n- bounded")]);
+
+		const result = getOrThrow(await compact(preparation, models, model));
+		const details = result.details as CompactionDetails;
+
+		expect(details.omittedUserIntentCount).toBeGreaterThan(0);
+		expect(details.omittedToolCallCount).toBeGreaterThan(0);
+		expect(details).toMatchObject({ formatVersion: 2, userIntentCount: 80, toolCallCount: 80 });
+		expect(details.userIntentHistory).toBeUndefined();
+		expect(details.toolCallHistory).toBeUndefined();
+		expect(result.summary).toContain('"omittedCount":');
+		expect(result.summary).toContain('"oversizedLatestExcerpt":');
+		expect(result.summary).toContain("LATEST_HEAD_");
+		expect(result.summary).toContain("_LATEST_TAIL");
+		expect(result.summary.length).toBeLessThan(110000);
 	});
 });
 

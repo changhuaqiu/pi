@@ -32,17 +32,295 @@ import {
 
 /** File-operation details stored on generated compaction entries. */
 export interface CompactionDetails {
+	/** Structured compaction format. Missing on legacy entries. */
+	formatVersion?: 2;
 	/** Files read in the compacted history. */
 	readFiles: string[];
 	/** Files modified in the compacted history. */
 	modifiedFiles: string[];
+	/** Legacy cumulative snapshot retained only for transition compatibility. */
+	userIntentHistory?: string[];
+	/** Legacy cumulative snapshot retained only for transition compatibility. */
+	toolCallHistory?: CompactedToolCall[];
+	/** Older user messages omitted from the bounded deterministic context block. */
+	omittedUserIntentCount?: number;
+	/** Older tool-call records omitted from the bounded deterministic context block. */
+	omittedToolCallCount?: number;
+	/** Highest assigned tool-call sequence, including records omitted by the bound. */
+	lastToolCallSequence?: number;
+	/** Number of exact user messages represented by the compaction. */
+	userIntentCount?: number;
+	/** Number of tool invocations represented by the compaction. */
+	toolCallCount?: number;
+	/** Whether a legacy summary was quarantined because its content provenance is unknown. */
+	legacySummaryQuarantined?: true;
 }
+
+/** Durable record of a tool invocation whose output is no longer present in compacted context. */
+export interface CompactedToolCall {
+	sequence: number;
+	id: string;
+	name: string;
+	arguments: string;
+	status: "success" | "error" | "cancelled" | "unknown";
+	outputDisposition: "removed" | "empty" | "not_present";
+}
+
+const TOOL_OUTPUT_REMOVED_MARKER = "[Tool output removed during compaction]";
+const MAX_USER_INTENT_HISTORY_CHARS = 64_000;
+const MAX_TOOL_CALL_HISTORY_CHARS = 32_000;
+
 function safeJsonStringify(value: unknown): string {
 	try {
 		return JSON.stringify(value) ?? "undefined";
 	} catch {
 		return "[unserializable]";
 	}
+}
+
+function textFromUserMessage(message: AgentMessage): string | undefined {
+	if (message.role !== "user") return undefined;
+	if (typeof message.content === "string") return message.content;
+	const parts: string[] = [];
+	for (const block of message.content) {
+		if (block.type === "text") {
+			parts.push(block.text);
+		} else if (block.type === "image") {
+			parts.push("[Image omitted from compacted context; original remains in the session]");
+		}
+	}
+	return parts.join("\n");
+}
+
+function hasToolOutput(message: Extract<AgentMessage, { role: "toolResult" }>): boolean {
+	return message.content.some((block) => block.type === "image" || (block.type === "text" && block.text.length > 0));
+}
+
+function redactToolOutputs(messages: AgentMessage[]): AgentMessage[] {
+	return messages.map((message) => {
+		if (message.role === "toolResult") {
+			const disposition = hasToolOutput(message) ? "removed" : "empty";
+			return {
+				...message,
+				content: [
+					{
+						type: "text",
+						text: `${TOOL_OUTPUT_REMOVED_MARKER} tool=${message.toolName} id=${message.toolCallId} status=${message.isError ? "error" : "success"} disposition=${disposition}`,
+					},
+				],
+			};
+		}
+		if (message.role === "bashExecution") {
+			return {
+				...message,
+				output: message.output ? TOOL_OUTPUT_REMOVED_MARKER : "",
+				truncated: false,
+				fullOutputPath: undefined,
+			};
+		}
+		return message;
+	});
+}
+
+function collectToolCalls(messages: AgentMessage[], startingSequence = 0): CompactedToolCall[] {
+	const records: CompactedToolCall[] = [];
+	const recordIndexes = new Map<string, number>();
+	let sequence = startingSequence;
+	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const block of message.content) {
+				if (block.type !== "toolCall") continue;
+				recordIndexes.set(block.id, records.length);
+				records.push({
+					sequence: ++sequence,
+					id: block.id,
+					name: block.name,
+					arguments: safeJsonStringify(block.arguments),
+					status: "unknown",
+					outputDisposition: "not_present",
+				});
+			}
+			continue;
+		}
+		if (message.role === "toolResult") {
+			const existingIndex = recordIndexes.get(message.toolCallId);
+			const record: CompactedToolCall = {
+				sequence: existingIndex === undefined ? ++sequence : records[existingIndex].sequence,
+				id: message.toolCallId,
+				name: message.toolName,
+				arguments: existingIndex === undefined ? "{}" : records[existingIndex].arguments,
+				status: message.isError ? "error" : "success",
+				outputDisposition: hasToolOutput(message) ? "removed" : "empty",
+			};
+			if (existingIndex === undefined) {
+				recordIndexes.set(message.toolCallId, records.length);
+				records.push(record);
+			} else {
+				records[existingIndex] = record;
+			}
+			continue;
+		}
+		if (message.role === "bashExecution") {
+			records.push({
+				sequence: ++sequence,
+				id: `bash-${message.timestamp}`,
+				name: "bash",
+				arguments: safeJsonStringify({ command: message.command }),
+				status: message.cancelled ? "cancelled" : message.exitCode === 0 ? "success" : "error",
+				outputDisposition: message.output ? "removed" : "empty",
+			});
+		}
+	}
+	return records;
+}
+
+function isCompactedToolCall(value: unknown): value is CompactedToolCall {
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as Partial<CompactedToolCall>;
+	return (
+		typeof record.sequence === "number" &&
+		Number.isSafeInteger(record.sequence) &&
+		record.sequence > 0 &&
+		typeof record.id === "string" &&
+		typeof record.name === "string" &&
+		typeof record.arguments === "string" &&
+		(record.status === "success" ||
+			record.status === "error" ||
+			record.status === "cancelled" ||
+			record.status === "unknown") &&
+		(record.outputDisposition === "removed" ||
+			record.outputDisposition === "empty" ||
+			record.outputDisposition === "not_present")
+	);
+}
+
+function validNonNegativeInteger(value: unknown): number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function boundUserIntentHistory(
+	messages: string[],
+	previousOmittedCount: number,
+): {
+	messages: string[];
+	omittedCount: number;
+	oversizedLatestExcerpt?: { originalChars: number; head: string; tail: string };
+} {
+	if (messages.length === 0) return { messages: [], omittedCount: previousOmittedCount };
+	const latestMessage = messages[messages.length - 1];
+	const oversizedLatestExcerpt =
+		encodeManagedSection(latestMessage).length > MAX_USER_INTENT_HISTORY_CHARS
+			? {
+					originalChars: latestMessage.length,
+					head: latestMessage.slice(0, 4000),
+					tail: latestMessage.slice(-4000),
+				}
+			: undefined;
+	const selectedIndexes = new Set<number>();
+	let usedChars = 0;
+	const candidateIndexes = [
+		messages.length - 1,
+		0,
+		...Array.from({ length: Math.max(0, messages.length - 2) }, (_, index) => messages.length - index - 2),
+	];
+	for (const index of candidateIndexes) {
+		if (selectedIndexes.has(index)) continue;
+		const message = messages[index];
+		const messageChars = encodeManagedSection(message).length;
+		if (usedChars + messageChars > MAX_USER_INTENT_HISTORY_CHARS) continue;
+		selectedIndexes.add(index);
+		usedChars += messageChars;
+	}
+	const selected = [...selectedIndexes].sort((a, b) => a - b).map((index) => messages[index]);
+	return {
+		messages: selected,
+		omittedCount: previousOmittedCount + messages.length - selected.length,
+		oversizedLatestExcerpt,
+	};
+}
+
+function boundToolCallHistory(
+	records: CompactedToolCall[],
+	previousOmittedCount: number,
+): { records: CompactedToolCall[]; omittedCount: number } {
+	const selected: CompactedToolCall[] = [];
+	let usedChars = 0;
+	for (let index = records.length - 1; index >= 0; index--) {
+		const record = records[index];
+		let boundedRecord = record;
+		let recordChars = encodeManagedSection(boundedRecord).length;
+		if (recordChars > MAX_TOOL_CALL_HISTORY_CHARS) {
+			boundedRecord = {
+				...record,
+				arguments: `[arguments omitted from compacted context; ${record.arguments.length} characters remain in the original session]`,
+			};
+			recordChars = encodeManagedSection(boundedRecord).length;
+		}
+		if (usedChars + recordChars > MAX_TOOL_CALL_HISTORY_CHARS) continue;
+		selected.push(boundedRecord);
+		usedChars += recordChars;
+	}
+	selected.reverse();
+	return {
+		records: selected,
+		omittedCount: previousOmittedCount + records.length - selected.length,
+	};
+}
+
+function stripManagedCompactionSections(summary: string): string {
+	return summary
+		.replace(/\n*<user-intent-history(?:\s[^>]*)?>[\s\S]*?<\/user-intent-history>\n*/g, "\n")
+		.replace(/\n*<tool-call-history(?:\s[^>]*)?>[\s\S]*?<\/tool-call-history>\n*/g, "\n")
+		.trim();
+}
+
+function encodeManagedSection(value: unknown): string {
+	return safeJsonStringify(value).replace(/[<>&]/g, (character) => {
+		switch (character) {
+			case "<":
+				return "\\u003c";
+			case ">":
+				return "\\u003e";
+			default:
+				return "\\u0026";
+		}
+	});
+}
+
+function formatUserIntentHistory(
+	messages: string[],
+	omittedCount: number,
+	hasQuarantinedLegacySummary: boolean,
+	oversizedLatestExcerpt?: { originalChars: number; head: string; tail: string },
+): string {
+	if (messages.length === 0 && omittedCount === 0 && !hasQuarantinedLegacySummary && !oversizedLatestExcerpt) {
+		return "";
+	}
+	return `\n\n<user-intent-history format="json">\n${encodeManagedSection({
+		precedence:
+			"Messages are chronological, take precedence over the execution checkpoint, and later messages override earlier conflicts.",
+		legacyContext: hasQuarantinedLegacySummary
+			? {
+					quarantined: true,
+					warning:
+						"A legacy model-generated summary was withheld because user intent and tool output could not be separated safely. Rely on verbatim messages and ask the user when intent is ambiguous.",
+				}
+			: undefined,
+		omittedCount,
+		oversizedLatestExcerpt: oversizedLatestExcerpt
+			? {
+					...oversizedLatestExcerpt,
+					warning:
+						"The latest message exceeded the projection bound; this deterministic head/tail excerpt is not verbatim-complete. The full message remains in compaction details.",
+				}
+			: undefined,
+		messages,
+	})}\n</user-intent-history>`;
+}
+
+function formatToolCallHistory(records: CompactedToolCall[], omittedCount: number): string {
+	if (records.length === 0 && omittedCount === 0) return "";
+	return `\n\n<tool-call-history format="json">\n${encodeManagedSection({ omittedCount, records })}\n</tool-call-history>`;
 }
 
 function extractFileOperations(
@@ -468,18 +746,13 @@ export const SUMMARIZATION_SYSTEM_PROMPT = `You are a context summarization assi
 
 Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.`;
 
-const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
+const SUMMARIZATION_PROMPT = `The messages above are a conversation to summarize. Create a structured execution checkpoint that another LLM will use to continue the work.
+
+User intent is preserved separately and appended deterministically. Do not invent, reinterpret, or restate the user's goal. Tool outputs have been removed intentionally. Do not infer or fabricate their contents.
 
 Use this EXACT format:
 
-## Goal
-[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]
-
-## Constraints & Preferences
-- [Any constraints, preferences, or requirements mentioned by user]
-- [Or "(none)" if none were mentioned]
-
-## Progress
+## Execution Checkpoint
 ### Done
 - [x] [Completed tasks/changes]
 
@@ -504,22 +777,20 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 const UPDATE_SUMMARIZATION_PROMPT = `The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
 
 Update the existing structured summary with new information. RULES:
-- PRESERVE all existing information from the previous summary
+- PRESERVE execution progress, decisions, file paths, errors, and unresolved context from the previous summary
+- Do not add new interpretations of user intent. Preserve legacy Goal or Constraints sections only when no verbatim history is available
+- REMOVE any quoted or verbatim tool-output content; preserve only the execution facts needed to continue
 - ADD new progress, decisions, and context from the new messages
-- UPDATE the Progress section: move items from "In Progress" to "Done" when completed
+- User intent is preserved separately; do not invent, reinterpret, or restate it
+- Tool outputs were removed intentionally; do not infer or fabricate their contents
+- UPDATE the checkpoint: move items from "In Progress" to "Done" when completed
 - UPDATE "Next Steps" based on what was accomplished
 - PRESERVE exact file paths, function names, and error messages
 - If something is no longer relevant, you may remove it
 
 Use this EXACT format:
 
-## Goal
-[Preserve existing goals, add new ones if the task expanded]
-
-## Constraints & Preferences
-- [Preserve existing, add new ones discovered]
-
-## Progress
+## Execution Checkpoint
 ### Done
 - [x] [Include previously done items AND newly completed items]
 
@@ -592,11 +863,11 @@ export async function generateSummaryWithUsage(
 	if (customInstructions) {
 		basePrompt = `${basePrompt}\n\nAdditional focus: ${customInstructions}`;
 	}
-	const llmMessages = convertToLlm(currentMessages);
+	const llmMessages = convertToLlm(redactToolOutputs(currentMessages));
 	const conversationText = serializeConversation(llmMessages);
 	let promptText = `<conversation>\n${conversationText}\n</conversation>\n\n`;
 	if (previousSummary) {
-		promptText += `<previous-summary>\n${previousSummary}\n</previous-summary>\n\n`;
+		promptText += `<previous-summary>\n${stripManagedCompactionSections(previousSummary)}\n</previous-summary>\n\n`;
 	}
 	promptText += basePrompt;
 
@@ -655,6 +926,14 @@ export interface CompactionPreparation {
 	tokensBefore: number;
 	/** Previous compaction summary used for iterative updates. */
 	previousSummary?: string;
+	/** Exact user-authored text accumulated outside the retained raw tail. */
+	userIntentHistory?: string[];
+	/** Accumulated tool invocations whose outputs are absent from compacted context. */
+	toolCallHistory?: CompactedToolCall[];
+	/** Highest assigned tool-call sequence. */
+	lastToolCallSequence?: number;
+	/** Whether a legacy summary was quarantined because its content provenance is unknown. */
+	legacySummaryQuarantined?: true;
 	/** File operations extracted from summarized history. */
 	fileOps: FileOperations;
 	/** Settings used to prepare compaction. */
@@ -679,14 +958,48 @@ export function prepareCompaction(
 	}
 
 	let previousSummary: string | undefined;
+	let previousUserIntentHistory: string[] = [];
+	let previousToolCallHistory: CompactedToolCall[] = [];
+	let lastToolCallSequence = 0;
+	let legacySummaryQuarantined: true | undefined;
+	let previousRetainedTail: AgentMessage[] = [];
 	let boundaryStart = 0;
 	if (prevCompactionIndex >= 0) {
 		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
-		previousSummary = prevCompaction.summary;
-		const firstKeptEntryIndex = prevCompaction.firstKeptEntryId
-			? pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId)
-			: -1;
-		boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+		previousRetainedTail = prevCompaction.retainedTail ?? [];
+		const details =
+			!prevCompaction.fromHook && prevCompaction.details
+				? (prevCompaction.details as Partial<CompactionDetails>)
+				: undefined;
+		const hasStructuredCompaction = details?.formatVersion === 2 || Array.isArray(details?.userIntentHistory);
+		if (hasStructuredCompaction) {
+			previousSummary = stripManagedCompactionSections(prevCompaction.summary);
+			legacySummaryQuarantined = details.legacySummaryQuarantined === true ? true : undefined;
+			if (details) {
+				if (Array.isArray(details.userIntentHistory)) {
+					previousUserIntentHistory = details.userIntentHistory.filter(
+						(message): message is string => typeof message === "string",
+					);
+				}
+				if (Array.isArray(details.toolCallHistory)) {
+					previousToolCallHistory = details.toolCallHistory.filter(isCompactedToolCall);
+				}
+				lastToolCallSequence = validNonNegativeInteger(details.lastToolCallSequence);
+				for (const record of previousToolCallHistory) {
+					lastToolCallSequence = Math.max(lastToolCallSequence, record.sequence);
+				}
+			}
+		} else {
+			legacySummaryQuarantined = true;
+		}
+		if (prevCompaction.retainedTail) {
+			boundaryStart = prevCompactionIndex + 1;
+		} else {
+			const firstKeptEntryIndex = prevCompaction.firstKeptEntryId
+				? pathEntries.findIndex((entry) => entry.id === prevCompaction.firstKeptEntryId)
+				: -1;
+			boundaryStart = firstKeptEntryIndex >= 0 ? firstKeptEntryIndex : prevCompactionIndex + 1;
+		}
 	}
 	const boundaryEnd = pathEntries.length;
 
@@ -700,7 +1013,7 @@ export function prepareCompaction(
 	const firstKeptEntryId = firstKeptEntry.id;
 
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
-	const messagesToSummarize: AgentMessage[] = [];
+	const messagesToSummarize: AgentMessage[] = [...previousRetainedTail];
 	for (let i = boundaryStart; i < historyEnd; i++) {
 		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
 		if (msg) messagesToSummarize.push(msg);
@@ -712,11 +1025,35 @@ export function prepareCompaction(
 			if (msg) turnPrefixMessages.push(msg);
 		}
 	}
-	const retainedTail: AgentMessage[] = [];
+	const compactedMessages = cutPoint.isSplitTurn
+		? [...messagesToSummarize, ...turnPrefixMessages]
+		: messagesToSummarize;
+	const messagesFromBranchHistory: AgentMessage[] = [];
+	for (let i = 0; i < cutPoint.firstKeptEntryIndex; i++) {
+		const message = getMessageFromEntryForCompaction(pathEntries[i]);
+		if (message) messagesFromBranchHistory.push(message);
+	}
+	const hasFullPreCompactionHistory =
+		prevCompactionIndex < 0 || pathEntries.slice(0, prevCompactionIndex).some((entry) => entry.type === "message");
+	const durableMessages = hasFullPreCompactionHistory ? messagesFromBranchHistory : compactedMessages;
+	const accumulatedUserIntentHistory = hasFullPreCompactionHistory
+		? durableMessages.map(textFromUserMessage).filter((message): message is string => message !== undefined)
+		: [
+				...previousUserIntentHistory,
+				...durableMessages.map(textFromUserMessage).filter((message): message is string => message !== undefined),
+			];
+	const accumulatedToolCallHistory = hasFullPreCompactionHistory
+		? collectToolCalls(durableMessages)
+		: [...previousToolCallHistory, ...collectToolCalls(durableMessages, lastToolCallSequence)];
+	if (accumulatedToolCallHistory.length > 0) {
+		lastToolCallSequence = accumulatedToolCallHistory[accumulatedToolCallHistory.length - 1].sequence;
+	}
+	const rawRetainedTail: AgentMessage[] = [];
 	for (let i = cutPoint.firstKeptEntryIndex; i < boundaryEnd; i++) {
 		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
-		if (msg) retainedTail.push(msg);
+		if (msg) rawRetainedTail.push(msg);
 	}
+	const retainedTail = redactToolOutputs(rawRetainedTail);
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
 	if (cutPoint.isSplitTurn) {
 		for (const msg of turnPrefixMessages) {
@@ -732,6 +1069,10 @@ export function prepareCompaction(
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		userIntentHistory: accumulatedUserIntentHistory,
+		toolCallHistory: accumulatedToolCallHistory,
+		lastToolCallSequence,
+		legacySummaryQuarantined,
 		fileOps,
 		settings,
 	});
@@ -739,10 +1080,9 @@ export function prepareCompaction(
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT = `This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
 
-Summarize the prefix to provide context for the retained suffix:
+User intent is preserved separately and appended deterministically. Tool outputs have been removed intentionally. Do not infer their contents or restate the user's request.
 
-## Original Request
-[What did the user ask for in this turn?]
+Summarize only the execution context needed for the retained suffix:
 
 ## Early Progress
 - [Key decisions and work done in the prefix]
@@ -774,6 +1114,10 @@ export async function compact(
 		isSplitTurn,
 		tokensBefore,
 		previousSummary,
+		userIntentHistory = [],
+		toolCallHistory = [],
+		lastToolCallSequence = 0,
+		legacySummaryQuarantined,
 		fileOps,
 		settings,
 	} = preparation;
@@ -845,6 +1189,29 @@ export async function compact(
 		summaryUsage = summaryResult.value.usage;
 	}
 
+	const candidateUserIntentHistory =
+		preparation.userIntentHistory !== undefined
+			? userIntentHistory
+			: [...messagesToSummarize, ...turnPrefixMessages]
+					.map(textFromUserMessage)
+					.filter((message): message is string => message !== undefined);
+	const boundedUserIntentHistory = boundUserIntentHistory(candidateUserIntentHistory, 0);
+	const candidateToolCallHistory =
+		preparation.toolCallHistory !== undefined
+			? toolCallHistory
+			: collectToolCalls([...messagesToSummarize, ...turnPrefixMessages], lastToolCallSequence);
+	const boundedToolCallHistory = boundToolCallHistory(candidateToolCallHistory, 0);
+	const resultingLastToolCallSequence =
+		candidateToolCallHistory.length > 0
+			? candidateToolCallHistory[candidateToolCallHistory.length - 1].sequence
+			: lastToolCallSequence;
+	summary += formatUserIntentHistory(
+		boundedUserIntentHistory.messages,
+		boundedUserIntentHistory.omittedCount,
+		legacySummaryQuarantined !== undefined,
+		boundedUserIntentHistory.oversizedLatestExcerpt,
+	);
+	summary += formatToolCallHistory(boundedToolCallHistory.records, boundedToolCallHistory.omittedCount);
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
 	await onProgress?.({ phase: "finalizing", text: summary });
@@ -855,7 +1222,17 @@ export async function compact(
 		tokensBefore,
 		usage: summaryUsage,
 		retainedTail,
-		details: { readFiles, modifiedFiles } as CompactionDetails,
+		details: {
+			formatVersion: 2,
+			readFiles,
+			modifiedFiles,
+			omittedUserIntentCount: boundedUserIntentHistory.omittedCount,
+			omittedToolCallCount: boundedToolCallHistory.omittedCount,
+			lastToolCallSequence: resultingLastToolCallSequence,
+			userIntentCount: candidateUserIntentHistory.length,
+			toolCallCount: candidateToolCallHistory.length,
+			legacySummaryQuarantined,
+		} as CompactionDetails,
 	});
 }
 async function generateTurnPrefixSummary(
@@ -873,7 +1250,7 @@ async function generateTurnPrefixSummary(
 		Math.floor(0.5 * reserveTokens),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
-	const llmMessages = convertToLlm(messages);
+	const llmMessages = convertToLlm(redactToolOutputs(messages));
 	const conversationText = serializeConversation(llmMessages);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 	const summarizationMessages = [

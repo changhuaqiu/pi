@@ -39,6 +39,12 @@ export interface Keybindings {
 	"tui.select.pageDown": true;
 	"tui.select.confirm": true;
 	"tui.select.cancel": true;
+	"tui.scroll.up": true;
+	"tui.scroll.down": true;
+	"tui.scroll.pageUp": true;
+	"tui.scroll.pageDown": true;
+	"tui.scroll.home": true;
+	"tui.scroll.end": true;
 }
 
 export type Keybinding = keyof Keybindings;
@@ -131,6 +137,12 @@ export const TUI_KEYBINDINGS = {
 		defaultKeys: ["escape", "ctrl+c"],
 		description: "Cancel selection",
 	},
+	"tui.scroll.up": { defaultKeys: "up", description: "Scroll up" },
+	"tui.scroll.down": { defaultKeys: "down", description: "Scroll down" },
+	"tui.scroll.pageUp": { defaultKeys: "pageUp", description: "Scroll one page up" },
+	"tui.scroll.pageDown": { defaultKeys: "pageDown", description: "Scroll one page down" },
+	"tui.scroll.home": { defaultKeys: "home", description: "Scroll to top" },
+	"tui.scroll.end": { defaultKeys: "end", description: "Scroll to bottom" },
 } as const satisfies KeybindingDefinitions;
 
 export interface KeybindingConflict {

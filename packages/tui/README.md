@@ -9,7 +9,7 @@ Minimal terminal UI framework with differential rendering and synchronized outpu
 - **Bracketed Paste Mode**: Handles large pastes correctly with markers for >10 line pastes
 - **Component-based**: Simple Component interface with render() method
 - **Theme Support**: Components accept theme interfaces for customizable styling
-- **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, Spacer, Image, Box, Container
+- **Built-in Components**: Text, TruncatedText, Input, Editor, Markdown, Loader, SelectList, SettingsList, Spacer, Image, Box, Container, HorizontalLayout, ScrollView
 - **Inline Images**: Renders images in terminals that support Kitty or iTerm2 graphics protocols
 - **Autocomplete Support**: File paths and slash commands
 
@@ -243,6 +243,43 @@ const box = new Box(
 box.addChild(new Text("Content"));
 box.setBgFn((text) => chalk.bgBlue(text));  // Change background dynamically
 ```
+
+### HorizontalLayout
+
+Arranges components in fixed, percentage, or flexible columns without exceeding the terminal width.
+
+```typescript
+const layout = new HorizontalLayout(
+  [
+    { component: sidebar, width: 24 },
+    { component: content },
+    { component: inspector, width: "25%", minWidth: 16 },
+  ],
+  { gap: 1 },
+);
+```
+
+Gaps shrink before child minimum widths. If even the minimums do not fit, columns degrade without overflowing.
+
+### ScrollView
+
+Provides a fixed-height viewport around any component. Indicators consume rows inside the viewport.
+
+```typescript
+const scrollView = new ScrollView(content, 12, {
+  paddingX: 1,
+  pageSize: "half",
+  theme: {
+    scrollUpIndicator: (text) => chalk.dim(text),
+    scrollDownIndicator: (text) => chalk.dim(text),
+  },
+});
+
+scrollView.scrollToBottom(); // Follow appended content
+scrollView.maxVisibleLines = 20;
+```
+
+Up, Down, Page Up, Page Down, Home, and End are configurable through `tui.scroll.*` keybindings. These navigation bindings are consumed by the viewport before other input is delegated to its child.
 
 ### Text
 

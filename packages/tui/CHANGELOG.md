@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `HorizontalLayout` for bounded fixed, percentage, and flexible terminal columns with adaptive gaps ([#7258](https://github.com/earendil-works/pi-mono/issues/7258)).
+- Added `ScrollView`, a fixed-height component viewport with indicators, follow-bottom mode, focus delegation, and configurable navigation keybindings.
+
 ## [0.81.1] - 2026-07-21
 
 ## [0.81.0] - 2026-07-21

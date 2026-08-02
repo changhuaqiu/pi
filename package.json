@@ -40,7 +40,7 @@
 		"release:local": "node scripts/local-release.mjs",
 		"shrinkwrap:coding-agent": "node scripts/generate-coding-agent-shrinkwrap.mjs",
 		"install-lock:coding-agent": "node scripts/generate-coding-agent-install-lock.mjs",
-		"learning-agent": "tsx apps/learning-agent/src/main.ts",
+		"logos-agent": "tsx apps/logos-agent/src/main.ts",
 		"release:patch": "node scripts/release.mjs patch",
 		"release:minor": "node scripts/release.mjs minor",
 		"release:major": "node scripts/release.mjs major",

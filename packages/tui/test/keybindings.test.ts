@@ -11,6 +11,16 @@ describe("KeybindingsManager", () => {
 		assert.strictEqual(keybindings.matches("\x1b[106;5u", "tui.input.newLine"), true);
 	});
 
+	it("defines independently configurable scroll viewport actions", () => {
+		const keybindings = new KeybindingsManager(TUI_KEYBINDINGS);
+		assert.deepEqual(keybindings.getKeys("tui.scroll.up"), ["up"]);
+		assert.deepEqual(keybindings.getKeys("tui.scroll.down"), ["down"]);
+		assert.deepEqual(keybindings.getKeys("tui.scroll.pageUp"), ["pageUp"]);
+		assert.deepEqual(keybindings.getKeys("tui.scroll.pageDown"), ["pageDown"]);
+		assert.deepEqual(keybindings.getKeys("tui.scroll.home"), ["home"]);
+		assert.deepEqual(keybindings.getKeys("tui.scroll.end"), ["end"]);
+	});
+
 	it("does not evict selector confirm when input submit is rebound", () => {
 		const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, {
 			"tui.input.submit": ["enter", "ctrl+enter"],

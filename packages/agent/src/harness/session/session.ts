@@ -181,6 +181,19 @@ export class Session<TMetadata extends SessionMetadata = SessionMetadata> {
 		return this.storage.getPathToRootOrCompaction(leafId);
 	}
 
+	/** Return the complete active branch, including entries before the latest compaction. */
+	async getFullBranch(fromId?: string): Promise<SessionTreeEntry[]> {
+		const entries: SessionTreeEntry[] = [];
+		let entryId = fromId ?? (await this.storage.getLeafId());
+		while (entryId !== null) {
+			const entry = await this.storage.getEntry(entryId);
+			if (!entry) throw new SessionError("invalid_session", `Entry ${entryId} not found`);
+			entries.unshift(entry);
+			entryId = entry.parentId;
+		}
+		return entries;
+	}
+
 	async buildContextEntries(options: SessionContextBuildOptions = {}): Promise<SessionTreeEntry[]> {
 		return buildContextEntries(await this.getBranch(), this.mergeContextBuildOptions(options));
 	}
