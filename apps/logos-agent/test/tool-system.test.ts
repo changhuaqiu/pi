@@ -421,6 +421,25 @@ test("native CodeGraph tools register through one bounded read-only provider", (
 		descriptor.guidance?.join("\n") ?? "",
 		/codegraph_search for symbol locations/,
 	);
+	assert.match(
+		descriptor.guidance?.join("\n") ?? "",
+		/Do not infer a cross-file call chain from grep matches alone/,
+	);
+	assert.match(
+		descriptor.guidance?.join("\n") ?? "",
+		/follow with codegraph_node; use codegraph_explore only when one node is insufficient/,
+	);
+	assert.match(
+		descriptor.guidance?.join("\n") ?? "",
+		/Do not assume CodeGraph is stale without calling it/,
+	);
+	assert.match(
+		descriptor.guidance?.join("\n") ?? "",
+		/when stale or unknown, treat relationships as candidates and verify current locations and source with grep\/read_file/,
+	);
+	for (const candidate of codeGraphDescriptors) {
+		assert.deepEqual(candidate.guidance, descriptor.guidance);
+	}
 	const audit = descriptor.audit?.summarizeInput({
 		query: "trace private implementation details",
 		maxFiles: 2,
