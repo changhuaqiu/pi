@@ -76,6 +76,50 @@ test("finish_task records bounded details and requests a normal final summary", 
 	});
 });
 
+test("finish_task appends the runtime assurance level to the result", async () => {
+	for (const assurance of ["verified", "partial", "unverified"] as const) {
+		const tool = createFinishTaskTool({ loadAssurance: async () => assurance });
+		const result = await tool.execute(
+			"finish-1",
+			{ summary: "Implemented the fix" },
+			undefined,
+			undefined,
+		);
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+		assert.match(text, new RegExp(`Assurance: ${assurance} — `));
+		assert.match(text, /final user-facing summary/);
+		assert.equal(result.details.assurance, assurance);
+	}
+});
+
+test("finish_task omits assurance when it is unavailable or fails to load", async () => {
+	const withoutRun = createFinishTaskTool({ loadAssurance: async () => undefined });
+	const plain = await withoutRun.execute(
+		"finish-1",
+		{ summary: "Implemented the fix" },
+		undefined,
+		undefined,
+	);
+	const plainText = plain.content[0]?.type === "text" ? plain.content[0].text : "";
+	assert.doesNotMatch(plainText, /Assurance:/);
+	assert.equal(plain.details.assurance, undefined);
+
+	const failing = createFinishTaskTool({
+		loadAssurance: async () => {
+			throw new Error("no active run");
+		},
+	});
+	const result = await failing.execute(
+		"finish-2",
+		{ summary: "Implemented the fix" },
+		undefined,
+		undefined,
+	);
+	const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+	assert.doesNotMatch(text, /Assurance:/);
+	assert.equal(result.details.assurance, undefined);
+});
+
 test("a final text response completes only after finish_task succeeded", () => {
 	const message = finalSummaryMessage();
 	assert.equal(hasSuccessfulTaskCompletion(message, new Set(["finish-1"])), true);

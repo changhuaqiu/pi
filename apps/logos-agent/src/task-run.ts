@@ -484,6 +484,10 @@ function computeAssurance(
 	return "unverified";
 }
 
+export function previewAssurance(state: TaskRunState): TaskRunAssurance {
+	return computeAssurance(state, "success");
+}
+
 function evolveTaskRun(
 	state: TaskRunState | undefined,
 	event: TaskRunEvent,

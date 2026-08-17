@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentTool } from "../../../packages/agent/src/index.ts";
+import type { AgentMessage, AgentTool } from "../../../packages/agent/src/index.ts";
 import { Type } from "typebox";
-import type { CodeIntelligenceProvider } from "../src/code-intelligence.ts";
+import {
+	CODEGRAPH_RESULT_BUDGET_BYTES,
+	type CodeIntelligenceProvider,
+} from "../src/code-intelligence.ts";
 import {
 	InMemoryToolPermissionStore,
 	ToolSystem,
@@ -31,6 +34,7 @@ import {
 	type LogosApprovalSubject,
 	type LogosTool,
 } from "../src/logos-tools.ts";
+import { createContextManager } from "../src/context-manager.ts";
 import { createNodeReadOnlyWorkspaceOperations } from "../src/read-only-tools.ts";
 import { createNodeRunTaskOperations } from "../src/run-task-tool.ts";
 import { createNodeWorkspaceInfoOperations } from "../src/workspace-info.ts";
@@ -252,6 +256,13 @@ test("all Logos Agent tools register through descriptors", () => {
 		descriptors.every((descriptor) => descriptor.defaultPermission === "allow"),
 		true,
 	);
+	assert.equal(
+		descriptors.reduce(
+			(total, descriptor) => total + (descriptor.guidance?.length ?? 0),
+			0,
+		),
+		8,
+	);
 	const prompt = system.buildSystemPrompt("Base");
 	assert.doesNotMatch(prompt, /permission=ask/);
 	assert.match(prompt, /apply_edit: permission=allow/);
@@ -266,12 +277,18 @@ test("all Logos Agent tools register through descriptors", () => {
 	assert.match(prompt, /stop_command: permission=allow/);
 	assert.match(prompt, /ask_user: permission=allow/);
 	assert.match(prompt, /user\.interact\(clarification\)/);
-	assert.match(prompt, /answer would materially change the result/);
-	assert.match(prompt, /Do not use ask_user for progress updates/);
-	assert.match(prompt, /Never ask the user to paste credentials/);
-	assert.match(prompt, /Never ask the user to approve a proposal ID/);
-	assert.match(prompt, /Never delete and recreate an existing file/);
-	assert.match(prompt, /apply_edit runs automatically by default/);
+	assert.doesNotMatch(prompt, /Never ask the user to paste credentials/);
+	assert.doesNotMatch(prompt, /Never ask the user to approve a proposal ID/);
+	const askDescriptor = descriptors.find((descriptor) => descriptor.tool.name === "ask_user");
+	const patchDescriptor = descriptors.find((descriptor) => descriptor.tool.name === "propose_patch");
+	const deleteDescriptor = descriptors.find((descriptor) => descriptor.tool.name === "propose_delete_file");
+	const applyDescriptor = descriptors.find((descriptor) => descriptor.tool.name === "apply_edit");
+	assert.match(askDescriptor?.tool.description ?? "", /materially change the result/);
+	assert.match(askDescriptor?.tool.description ?? "", /progress updates/);
+	assert.match(askDescriptor?.tool.description ?? "", /credentials, tokens, passwords/);
+	assert.match(patchDescriptor?.tool.description ?? "", /call apply_edit with its proposalId/);
+	assert.match(deleteDescriptor?.tool.description ?? "", /Never use delete followed by create/);
+	assert.match(applyDescriptor?.tool.description ?? "", /runs automatically by default/);
 	const directoryDescriptor = descriptors.find(
 		(descriptor) => descriptor.tool.name === "create_directories",
 	);
@@ -363,20 +380,23 @@ test("web_search registers only with an adapter and is allowed without approval"
 	assert.equal(JSON.stringify(audit).includes("latest TypeScript release"), false);
 });
 
-test("native CodeGraph tools register through one bounded read-only provider", () => {
+test("native CodeGraph tools register through one bounded read-only provider", async () => {
 	const workspaceRoot = process.cwd();
 	const provider: CodeIntelligenceProvider = {
 		id: "codegraph",
 		displayName: "CodeGraph",
 		beginTurn() {},
-		async run() {
+		async run(request) {
 			return {
 				availability: "ready",
 				freshness: "fresh",
-				text: "evidence",
+				text: "e".repeat(30 * 1024),
 				truncated: false,
 				reused: false,
-				resultKey: "result",
+				resultKey: `${request.operation}-result`,
+				originalBytes: 30 * 1024,
+				resultCount: 1,
+				fileCount: 1,
 			};
 		},
 	};
@@ -411,35 +431,17 @@ test("native CodeGraph tools register through one bounded read-only provider", (
 			descriptor.context?.history,
 			"compact-after-use",
 		);
+		assert.equal(descriptor.context?.maxBytes, CODEGRAPH_RESULT_BUDGET_BYTES);
 	}
 	const descriptor = codeGraphDescriptors.find(
 		(candidate) => candidate.tool.name === "codegraph_explore",
 	);
 	assert.ok(descriptor);
-	assert.equal(descriptor.context?.maxBytes, 32 * 1024);
-	assert.match(
-		descriptor.guidance?.join("\n") ?? "",
-		/codegraph_search for symbol locations/,
-	);
-	assert.match(
-		descriptor.guidance?.join("\n") ?? "",
-		/Do not infer a cross-file call chain from grep matches alone/,
-	);
-	assert.match(
-		descriptor.guidance?.join("\n") ?? "",
-		/follow with codegraph_node; use codegraph_explore only when one node is insufficient/,
-	);
-	assert.match(
-		descriptor.guidance?.join("\n") ?? "",
-		/Do not assume CodeGraph is stale without calling it/,
-	);
-	assert.match(
-		descriptor.guidance?.join("\n") ?? "",
-		/when stale or unknown, treat relationships as candidates and verify current locations and source with grep\/read_file/,
-	);
+	assert.equal(descriptor.context?.maxBytes, CODEGRAPH_RESULT_BUDGET_BYTES);
 	for (const candidate of codeGraphDescriptors) {
-		assert.deepEqual(candidate.guidance, descriptor.guidance);
+		assert.equal(candidate.guidance, undefined);
 	}
+	assert.match(descriptor.tool.description, /only when codegraph_node is insufficient/);
 	const audit = descriptor.audit?.summarizeInput({
 		query: "trace private implementation details",
 		maxFiles: 2,
@@ -447,6 +449,62 @@ test("native CodeGraph tools register through one bounded read-only provider", (
 	assert.equal(typeof audit?.queryHash, "string");
 	assert.equal(audit?.maxFiles, 2);
 	assert.equal(JSON.stringify(audit).includes("private implementation"), false);
+
+	const system = new ToolSystem<LogosTool, LogosApprovalSubject>({
+		workspaceRoot,
+		async requestApproval() { return false; },
+		createGenericApprovalSubject: createGenericLogosApprovalSubject,
+		async recordAudit() {},
+	});
+	for (const candidate of codeGraphDescriptors) system.register(candidate);
+	for (const toolName of ["codegraph_search", "codegraph_impact"] as const) {
+		const candidate = codeGraphDescriptors.find((item) => item.tool.name === toolName);
+		assert.ok(candidate);
+		const raw = await candidate.tool.execute(
+			`${toolName}-call`,
+			toolName === "codegraph_search" ? { query: "entry" } : { symbol: "entry" },
+		);
+		const governed = await system.onToolResult({
+			type: "tool_result",
+			toolCallId: `${toolName}-call`,
+			toolName,
+			input: {},
+			content: raw.content,
+			details: raw.details,
+			isError: false,
+		});
+		assert.notEqual(governed?.details, "<tool details truncated after redaction>");
+		assert.match(JSON.stringify(governed?.details), new RegExp(`${toolName.slice(10)}-result`));
+		assert.match(JSON.stringify(governed?.details), /"resultCount":1/);
+		const message: AgentMessage = {
+			role: "toolResult",
+			toolCallId: `${toolName}-call`,
+			toolName,
+			content: governed?.content ?? [],
+			details: governed?.details,
+			isError: false,
+			timestamp: 1,
+		};
+		const manager = createContextManager({
+			compactableToolNames: new Set(),
+			compactAfterUseToolNames: new Set([toolName]),
+		});
+		manager.prepare([message]);
+		const compacted = manager.prepare([message, {
+			role: "user",
+			content: [{ type: "text", text: "continue" }],
+			timestamp: 2,
+		}]).messages[0];
+		assert.equal(compacted?.role, "toolResult");
+		if (compacted?.role !== "toolResult") assert.fail("expected compacted tool result");
+		const compactedText = compacted.content[0];
+		assert.equal(compactedText?.type, "text");
+		assert.match(
+			compactedText?.type === "text" ? compactedText.text : "",
+			new RegExp(`resultKey=${toolName.slice(10)}-result`),
+		);
+		assert.match(compactedText?.type === "text" ? compactedText.text : "", /resultCount=1/);
+	}
 });
 
 test("run_command authorization binds the reviewed plan to the tool call", async () => {

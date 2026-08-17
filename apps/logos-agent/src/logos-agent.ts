@@ -108,7 +108,9 @@ import {
 import { createConfiguredWebSearchOperations } from "./web-search-tool.ts";
 import { SessionTaskRunJournal } from "./session-task-run-journal.ts";
 import {
+	previewAssurance,
 	TaskRunController,
+	type TaskRunAssurance,
 	type TaskRunEvidence,
 	type TaskRunManifest,
 	type TaskRunState,
@@ -126,14 +128,20 @@ import {
 	turnCompletionContinuationPrompt,
 	turnLengthContinuationPrompt,
 } from "./task-completion-tool.ts";
-import { TaskDeliberationController } from "./task-deliberation-tool.ts";
+import {
+	type ReflectionGuidanceInput,
+	type ReflectionGuidanceSummary,
+	TaskDeliberationController,
+} from "./task-deliberation-tool.ts";
 import {
 	isNormalTurnComplete,
 	TurnTaskLifecycle,
 } from "./turn-task-lifecycle.ts";
 import {
-	createToolResultContextProjector,
-} from "./model-context.ts";
+	createContextManager,
+	summarizeContextSnapshot,
+	type ContextSnapshotSummary,
+} from "./context-manager.ts";
 import {
 	createLogosAgentObservability,
 	type LogosAgentObservability,
@@ -144,6 +152,7 @@ import {
 export type LogosAgentEvent =
 	| AgentHarnessEvent
 	| { type: "audit"; record: ToolAuditRecord }
+	| { type: "context_snapshot"; snapshot: ContextSnapshotSummary }
 	| { type: "cache_observation_error"; message: string }
 	| {
 			type: "task_completion_retry";
@@ -303,6 +312,21 @@ export interface DirectoryMutationEvidence {
 
 function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function isReflectionGuidanceSummary(
+	value: unknown,
+): value is ReflectionGuidanceSummary {
+	if (typeof value !== "object" || value === null) return false;
+	const summary = value as Record<string, unknown>;
+	return (
+		typeof summary.changeSites === "number" &&
+		isStringArray(summary.changedPaths) &&
+		(summary.verification === "none" ||
+			summary.verification === "passed" ||
+			summary.verification === "failed") &&
+		isStringArray(summary.discrepancies)
+	);
 }
 
 export function describeDirectoryMutationEvidence(
@@ -509,6 +533,35 @@ export class HarnessLogosAgent implements LogosAgent {
 			operations: createNodeControlledEditOperations(this.config.workspaceRoot),
 		});
 		const taskDeliberation = new TaskDeliberationController();
+		const loadReflectionGuidance =
+			async (): Promise<ReflectionGuidanceInput | undefined> => {
+				const runId = this.activeTaskRunId;
+				let run: TaskRunState | undefined;
+				if (runId !== undefined) {
+					try {
+						run = await taskRuns.get(runId);
+					} catch {
+						run = undefined;
+					}
+				}
+				const goal = this.turnTaskLifecycle.getGoal();
+				if (goal === undefined && run === undefined) return undefined;
+				return {
+					...(goal === undefined ? {} : { goal }),
+					...(run === undefined ? {} : { run }),
+				};
+			};
+		const loadFinishTaskAssurance =
+			async (): Promise<TaskRunAssurance | undefined> => {
+				const runId = this.activeTaskRunId;
+				if (runId === undefined) return undefined;
+				try {
+					const run = await taskRuns.get(runId);
+					return run.status === "active" ? previewAssurance(run) : run.assurance;
+				} catch {
+					return undefined;
+				}
+			};
 		const toolSystem = new ToolSystem<LogosTool, LogosApprovalSubject>({
 			workspaceRoot: this.config.workspaceRoot,
 			permissionStore: this.toolPermissions,
@@ -543,6 +596,8 @@ export class HarnessLogosAgent implements LogosAgent {
 		for (const descriptor of createLogosToolDescriptors({
 			workspaceRoot: this.config.workspaceRoot,
 			taskDeliberation,
+			reflectionGuidance: loadReflectionGuidance,
+			finishTaskAssurance: loadFinishTaskAssurance,
 			userQuestionOperations: {
 				ask: async (question, signal) =>
 					await this.requestUserQuestion(question, signal),
@@ -561,11 +616,9 @@ export class HarnessLogosAgent implements LogosAgent {
 		})) {
 			toolSystem.register(descriptor);
 		}
-		const compactableToolNames = toolSystem.getCompactableToolNames();
-		const compactAfterUseToolNames = toolSystem.getCompactAfterUseToolNames();
-		const projectToolResultContext = createToolResultContextProjector({
-			compactableToolNames,
-			compactAfterUseToolNames,
+		const contextManager = createContextManager({
+			compactableToolNames: toolSystem.getCompactableToolNames(),
+			compactAfterUseToolNames: toolSystem.getCompactAfterUseToolNames(),
 		});
 		const buildSystemPrompt = () => toolSystem.buildSystemPrompt(systemPromptBase);
 		const toolsHash = () =>
@@ -622,10 +675,14 @@ export class HarnessLogosAgent implements LogosAgent {
 				this.config.thinkingLevel,
 			),
 		});
-		harness.on("context", (event) => {
-			const projected = projectToolResultContext(event.messages);
+		harness.on("context", async (event) => {
+			const snapshot = contextManager.prepare(event.messages);
+			await this.emit({
+				type: "context_snapshot",
+				snapshot: summarizeContextSnapshot(snapshot),
+			});
 			return {
-				messages: projected.messages,
+				messages: snapshot.messages,
 			};
 		});
 		harness.on("tool_call", async (event) => {
@@ -924,7 +981,10 @@ export class HarnessLogosAgent implements LogosAgent {
 					sourceId: toolCallId,
 					outcome: "completed",
 					subjectFingerprint,
-					metadata: { toolName },
+					metadata: {
+						toolName,
+						paths: typeof detail.path === "string" ? [detail.path] : [],
+					},
 				},
 				{ runId, idempotencyKey: `change:${toolCallId}` },
 			);
@@ -960,9 +1020,30 @@ export class HarnessLogosAgent implements LogosAgent {
 					metadata: {
 						toolName,
 						partialFailure: directoryMutation.partialFailure,
+						paths: directoryMutation.changed,
 					},
 				},
 				{ runId, idempotencyKey: `change:${toolCallId}` },
+			);
+			return;
+		}
+		if (toolName === "reflect_task" && !isError) {
+			const guidance = detail.guidance;
+			await this.recordTaskRunEvidence(
+				controller,
+				{
+					kind: "tool_result",
+					sourceId: toolCallId,
+					outcome: "completed",
+					metadata: {
+						toolName,
+						decision: detail.decision,
+						...(isReflectionGuidanceSummary(guidance)
+							? { guidance: { ...guidance } }
+							: {}),
+					},
+				},
+				{ runId, idempotencyKey: `reflection:${toolCallId}` },
 			);
 			return;
 		}

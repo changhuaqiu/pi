@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { after, before, test } from "node:test";
 import {
 	analyzeCodeGraphEditImpact,
+	CODEGRAPH_RESULT_BUDGET_BYTES,
 	createCodeGraphEnvironment,
 	createCodeGraphExploreTool,
 	createCodeGraphImpactTool,
@@ -329,6 +330,216 @@ test("CodeGraph provider maps native operations, caches status, and deduplicates
 	assert.deepEqual(requests[3]?.args, ["status", "--json"]);
 });
 
+test("CodeGraph applies one 32 KiB runtime result budget to every operation", async () => {
+	const provider = createCodeGraphProvider(workspaceRoot, async (request) =>
+		request.args[0] === "status"
+			? { exitCode: 0, stdout: "Index current", stderr: "" }
+			: { exitCode: 0, stdout: "x".repeat(40 * 1024), stderr: "" },
+	);
+	provider.beginTurn();
+	const requests = [
+		{ operation: "search" as const, query: "entry", limit: 10 },
+		{ operation: "node" as const, symbol: "entry", symbolsOnly: false },
+		{ operation: "explore" as const, query: "entry flow", maxFiles: 3 },
+		{ operation: "impact" as const, symbol: "entry", depth: 2 },
+	];
+
+	for (const request of requests) {
+		const result = await provider.run(request);
+		assert.equal(result.truncated, true);
+		assert.equal(
+			Buffer.byteLength(result.text, "utf8"),
+			CODEGRAPH_RESULT_BUDGET_BYTES,
+		);
+	}
+});
+
+test("CodeGraph explore preserves relationship evidence and samples every source file within its budget", async () => {
+	const source = [
+		"**Exploration: auth flow**",
+		"",
+		"Found 4 symbols across 2 files.",
+		"",
+		"**Relationships**",
+		"",
+		"**calls:**",
+		"- login -> verifySession",
+		"",
+		"**Source Code**",
+		"",
+		"Current source follows.",
+		"",
+		"**`src/auth.ts`** - login(calls)",
+		"```typescript",
+		"a".repeat(30_000),
+		"```",
+		"",
+		"**`src/session.ts`** - verifySession(calls)",
+		"```typescript",
+		"b".repeat(30_000),
+		"```",
+	].join("\r\n");
+	const provider = createCodeGraphProvider(workspaceRoot, async (request) =>
+		request.args[0] === "status"
+			? { exitCode: 0, stdout: "Index current", stderr: "" }
+			: { exitCode: 0, stdout: source, stderr: "" },
+	);
+	provider.beginTurn();
+
+	const result = await provider.run({
+		operation: "explore",
+		query: "login to verifySession",
+		maxFiles: 2,
+	});
+
+	assert.equal(result.truncated, true);
+	assert.match(result.text, /\*\*Relationships\*\*/);
+	assert.match(result.text, /login -> verifySession/);
+	assert.match(result.text, /src\/auth\.ts/);
+	assert.match(result.text, /src\/session\.ts/);
+	assert.match(result.text, /Source excerpts truncated/);
+	assert.ok(Buffer.byteLength(result.text, "utf8") <= CODEGRAPH_RESULT_BUDGET_BYTES);
+	assert.equal(result.originalBytes, Buffer.byteLength(source, "utf8"));
+	assert.equal(result.resultCount, 4);
+	assert.equal(result.fileCount, 2);
+});
+
+test("CodeGraph explore reserves file samples when relationships and introduction exceed the budget", async () => {
+	const source = [
+		"**Exploration: oversized flow**",
+		"",
+		"Found 2 symbols across 2 files.",
+		"",
+		"**Relationships**",
+		"",
+		"entry -> firstDependency",
+		"relationship evidence ".repeat(2_000),
+		"",
+		"**Source Code**",
+		"",
+		"near-budget introduction ".repeat(1_000),
+		"",
+		"**`src/first.ts`** - firstDependency(calls)",
+		"```typescript",
+		"first source ".repeat(2_000),
+		"```",
+		"",
+		"**`src/second.ts`** - secondDependency(calls)",
+		"```typescript",
+		"second source ".repeat(2_000),
+		"```",
+	].join("\n");
+	const provider = createCodeGraphProvider(workspaceRoot, async (request) =>
+		request.args[0] === "status"
+			? { exitCode: 0, stdout: "Index current", stderr: "" }
+			: { exitCode: 0, stdout: source, stderr: "" },
+	);
+	provider.beginTurn();
+
+	const result = await provider.run({
+		operation: "explore",
+		query: "oversized flow",
+		maxFiles: 2,
+	});
+
+	assert.equal(result.truncated, true);
+	assert.match(result.text, /\*\*Relationships\*\*/);
+	assert.match(result.text, /entry -> firstDependency/);
+	assert.match(result.text, /\*\*`src\/first\.ts`\*\*/);
+	assert.match(result.text, /\*\*`src\/second\.ts`\*\*/);
+	assert.match(result.text, /sampled 2 of 2 file blocks/);
+	assert.ok(Buffer.byteLength(result.text, "utf8") <= CODEGRAPH_RESULT_BUDGET_BYTES);
+});
+
+test("CodeGraph explore fairly bounds untrusted oversized file headers", async () => {
+	const fileBlocks = Array.from({ length: 6 }, (_, index) => [
+		`**\`src/file-${index}-${"x".repeat(6_000)}.ts\`** - oversized`,
+		"```typescript",
+		`source-${index}`,
+		"```",
+	].join("\n"));
+	const source = [
+		"**Exploration: hostile headers**",
+		"",
+		"Found 6 symbols across 6 files.",
+		"",
+		"**Relationships**",
+		"",
+		"entry -> dependency",
+		"",
+		"**Source Code**",
+		"",
+		...fileBlocks,
+	].join("\n");
+	const provider = createCodeGraphProvider(workspaceRoot, async (request) =>
+		request.args[0] === "status"
+			? { exitCode: 0, stdout: "Index current", stderr: "" }
+			: { exitCode: 0, stdout: source, stderr: "" },
+	);
+	provider.beginTurn();
+
+	const result = await provider.run({
+		operation: "explore",
+		query: "hostile headers",
+		maxFiles: 6,
+	});
+
+	assert.equal(result.truncated, true);
+	assert.match(result.text, /\*\*Relationships\*\*/);
+	assert.match(result.text, /entry -> dependency/);
+	for (let index = 0; index < 6; index += 1) {
+		assert.match(result.text, new RegExp(`file-${index}-`));
+	}
+	assert.match(result.text, /sampled 6 of 6 file blocks/);
+	assert.ok(Buffer.byteLength(result.text, "utf8") <= CODEGRAPH_RESULT_BUDGET_BYTES);
+});
+
+test("CodeGraph explore reserves relationships at the complete-header budget boundary", async () => {
+	const fileBlocks = Array.from({ length: 6 }, (_, index) => [
+		`**\`src/boundary-${index}-${"x".repeat(3_500)}.ts\`** - boundary`,
+		"```typescript",
+		`source-${index}-${"body ".repeat(600)}`,
+		"```",
+	].join("\n"));
+	const source = [
+		"**Exploration: boundary headers**",
+		"",
+		"Found 6 symbols across 6 files.",
+		"",
+		"**Relationships**",
+		"",
+		"relationship context ".repeat(70),
+		"entry -> boundaryDependency",
+		"",
+		"**Source Code**",
+		"",
+		"Current source follows.",
+		"",
+		...fileBlocks,
+	].join("\n");
+	const provider = createCodeGraphProvider(workspaceRoot, async (request) =>
+		request.args[0] === "status"
+			? { exitCode: 0, stdout: "Index current", stderr: "" }
+			: { exitCode: 0, stdout: source, stderr: "" },
+	);
+	provider.beginTurn();
+
+	const result = await provider.run({
+		operation: "explore",
+		query: "boundary headers",
+		maxFiles: 6,
+	});
+
+	assert.equal(result.truncated, true);
+	assert.match(result.text, /\*\*Relationships\*\*/);
+	assert.match(result.text, /entry -> boundaryDependency/);
+	for (let index = 0; index < 6; index += 1) {
+		assert.match(result.text, new RegExp(`boundary-${index}-`));
+	}
+	assert.match(result.text, /sampled 6 of 6 file blocks/);
+	assert.ok(Buffer.byteLength(result.text, "utf8") <= CODEGRAPH_RESULT_BUDGET_BYTES);
+});
+
 test("CodeGraph workspace manager initializes and syncs only its fixed workspace", async () => {
 	const requests: CodeGraphCommandRequest[] = [];
 	const runner: CodeGraphCommandRunner = async (request) => {
@@ -530,7 +741,10 @@ test("native CodeGraph tools preserve operation-specific requests and freshness 
 	assert.match(text, /verifySession/);
 	assert.equal(result.details.availability, "ready");
 	assert.equal(result.details.sourceMode, "current-on-disk-if-included");
+	assert.equal(result.details.resultBytes, Buffer.byteLength("src/auth.ts: login -> verifySession", "utf8"));
 	assert.equal(search.details.sourceMode, "not-included");
+	assert.equal(search.details.resultCount, 1);
+	assert.equal(search.details.fileCount, 1);
 	assert.deepEqual(search.details.anchors, [
 		{ name: "login", kind: "function", file: "src/auth.ts", line: 7 },
 	]);
@@ -540,6 +754,25 @@ test("native CodeGraph tools preserve operation-specific requests and freshness 
 	);
 	assert.equal(node.details.operation, "node");
 	assert.equal(impact.details.operation, "impact");
+});
+
+test("CodeGraph tool descriptions are the single routing contract", () => {
+	const provider: CodeIntelligenceProvider = {
+		id: "test-index",
+		displayName: "Test Index",
+		beginTurn() {},
+		async run() { throw new Error("unused"); },
+	};
+	const search = createCodeGraphSearchTool(provider);
+	const node = createCodeGraphNodeTool(provider);
+	const explore = createCodeGraphExploreTool(provider);
+	const impact = createCodeGraphImpactTool(provider);
+
+	assert.match(search.description, /only by symbol name/);
+	assert.match(search.description, /event names, string literals, error messages, paths, or regular expressions/);
+	assert.match(node.description, /after its name or path is established/);
+	assert.match(explore.description, /only when codegraph_node is insufficient/);
+	assert.match(impact.description, /not a list of direct callers/);
 });
 
 test("CodeGraph tools return a compact reference for reused results", async () => {

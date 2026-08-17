@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
+import type { TaskRunAssurance } from "./task-run.ts";
 
 const finishTaskSchema = Type.Object(
 	{
@@ -29,7 +30,19 @@ export interface FinishTaskDetails {
 	stage: "completed";
 	summary: string;
 	verification?: string;
+	assurance?: TaskRunAssurance;
 }
+
+export interface FinishTaskToolOptions {
+	loadAssurance?: () => Promise<TaskRunAssurance | undefined>;
+}
+
+const assuranceNotes: Record<TaskRunAssurance, string> = {
+	verified: "a verification check passed against the current workspace state",
+	partial: "verification passed earlier, but none covers the latest changes",
+	unverified:
+		"no passing verification covers the current workspace state; state exactly what was not verified in the final summary",
+};
 
 export const taskCompletionContinuationPrompt =
 	"Continue executing the current user task now. Do not only announce what you will do. Use the available tools for remaining work. When the task is genuinely complete, call finish_task as the only tool call. After its result, provide the concise final user-facing summary as normal assistant text.";
@@ -81,7 +94,9 @@ function parseFinishTaskInput(input: Readonly<Record<string, unknown>>): FinishT
 	};
 }
 
-export function createFinishTaskTool(): AgentTool<typeof finishTaskSchema, FinishTaskDetails> {
+export function createFinishTaskTool(
+	options: FinishTaskToolOptions = {},
+): AgentTool<typeof finishTaskSchema, FinishTaskDetails> {
 	return {
 		name: taskCompletionToolName,
 		label: "finish task",
@@ -92,20 +107,31 @@ export function createFinishTaskTool(): AgentTool<typeof finishTaskSchema, Finis
 		async execute(_toolCallId, rawInput, signal) {
 			if (signal?.aborted) throw signal.reason;
 			const input = parseFinishTaskInput(rawInput);
+			let assurance: TaskRunAssurance | undefined;
+			if (options.loadAssurance) {
+				try {
+					assurance = await options.loadAssurance();
+				} catch {
+					// Assurance is advisory; completion recording must not fail because of it.
+				}
+			}
 			const details: FinishTaskDetails = {
 				stage: "completed",
 				summary: input.summary,
 				...(input.verification === undefined
 					? {}
 					: { verification: input.verification }),
+				...(assurance === undefined ? {} : { assurance }),
 			};
+			const text = [
+				"Task completion recorded.",
+				...(assurance === undefined
+					? []
+					: [`Assurance: ${assurance} — ${assuranceNotes[assurance]}.`]),
+				"Now provide the concise final user-facing summary as normal assistant text. Do not call another tool.",
+			].join(" ");
 			return {
-				content: [
-					{
-						type: "text",
-						text: "Task completion recorded. Now provide the concise final user-facing summary as normal assistant text. Do not call another tool.",
-					},
-				],
+				content: [{ type: "text", text }],
 				details,
 			} satisfies AgentToolResult<FinishTaskDetails>;
 		},

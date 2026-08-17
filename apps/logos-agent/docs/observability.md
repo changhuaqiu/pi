@@ -21,6 +21,25 @@ flowchart TD
 
 一次 `prompt()` 产生一个 AGENT 根 span。Agent loop 中每次 Provider 请求产生一个 LLM 子 span，每个工具调用产生一个 TOOL 子 span。LLM span 包含模型、Provider、HTTP 状态、stop reason、token、缓存 token 和成本；TOOL span 包含工具名、调用 ID、结果状态及耗时。
 
+## Token 口径
+
+分析 Agent Loop 成本时，不能只读取 Trace 列表中的 prompt 与 completion 汇总。完整处理量应使用：
+
+```text
+processed total = fresh input + cache read + cache write + output
+```
+
+其中：
+
+- `fresh input` 是本次没有从 Provider Cache 读取的新输入；
+- `cache read` 是每轮重新使用的缓存 Context；
+- `output` 包含最终文本、工具调用和 Provider 报告的 Reasoning 用量；
+- `processed total` 才适合比较一个多轮 Agent Task 的实际 Context 放大量。
+
+缓存读取价格通常低于新输入，但它仍会反映同一历史在多个 Provider 请求中被重复处理。评估 Context 优化时应同时比较 Provider 请求数、首轮/峰值/末轮 Context、累计 Payload、Provider 耗时与 Processed Total。
+
+完整方法和当前量化基线见 [`context-governance.md`](./context-governance.md)。
+
 ## 管理 Phoenix
 
 在 `apps/logos-agent` 中运行：

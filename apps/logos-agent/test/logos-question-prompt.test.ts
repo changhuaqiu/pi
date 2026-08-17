@@ -15,7 +15,9 @@ function createPrompt(actions: UserQuestionAction[]): LogosQuestionPrompt {
 				{ label: "Inline logic", description: "Keep the behavior inside the TUI application" },
 			],
 		},
-		(action) => actions.push(action),
+		(action) => {
+			actions.push(action);
+		},
 	);
 }
 

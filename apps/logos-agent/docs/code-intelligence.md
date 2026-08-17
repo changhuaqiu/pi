@@ -80,29 +80,36 @@ never runs `index`, `install`, `upgrade`, or `uninstall`.
 The index is never injected into the system prompt or hidden behind the user
 message. Every CodeGraph payload now follows a model-visible tool decision:
 
-- `codegraph_search` locates symbol definitions without source.
-- `codegraph_node` inspects one known symbol or a file's structural map.
+- `codegraph_search` locates symbol definitions without source. It is not used
+  for event names, string literals, errors, paths, or regular expressions.
+- `codegraph_node` inspects one known symbol or a file's structural map after
+  the symbol name or path is established.
 - `codegraph_explore` handles focused multi-symbol flows, dynamic dispatch, and
-  cross-module relationships. Its native `maxFiles` parameter defaults to 3 and
-  is bounded to 6.
-- `codegraph_impact` returns an indexed dependency radius before refactoring.
+  cross-module relationships only when one node is insufficient. Its native
+  `maxFiles` parameter defaults to 3 and is bounded to 6.
+- `codegraph_impact` returns an indexed dependency radius before refactoring;
+  affected nodes are not presented as direct callers.
 
 Exact strings and regular expressions remain `grep` work. Current source remains
 `read_file` authority. `scope` is not exposed because CodeGraph `explore` has no
 native scope parameter; the previous implementation only appended scope text to
 the natural-language query.
 
-Search and impact output are capped at 16 KiB, node and explore output at 24 KiB.
-All four tools declare their history policy through ToolSystem. Search, node,
-and impact join the normal bounded compaction pool. Explore remains complete for
-the first provider request that consumes it, then becomes a short summary on
-later provider requests. Identical normalized requests in one turn execute
-CodeGraph once; a duplicate returns a small reference to the earlier result
-rather than repeating the payload.
+Every CodeGraph provider payload is capped at 32 KiB, and all four ToolSystem
+descriptors enforce the same 32 KiB model-facing result budget. Explore
+preserves its relationship summary and samples every returned source file before
+truncating source excerpts. All four tools remain complete for the first
+provider request that consumes them, then become short summaries on later
+provider requests. Those summaries retain bounded facts such as operation,
+freshness, result key, result bytes, result count, file count, edge count, and
+the number of displayed anchors. Identical normalized requests in one turn
+execute CodeGraph once; a duplicate returns a small reference to the earlier
+result rather than repeating the payload.
 
 Audit records store query or symbol byte counts and hashes, not raw private
 queries. Tool details expose operation, availability, relationship freshness,
-truncation, same-turn reuse, and a stable result key.
+truncation, same-turn reuse, a stable result key, bounded byte counts, and
+operation-specific result counts.
 
 Graph relationships and symbol locations are derived index evidence. Node and
 explore may include source re-read from the current disk, but a stale index can

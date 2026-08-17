@@ -2,6 +2,7 @@ import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
 import type { ToolCallEvent, ToolCallResult } from "../../../packages/agent/src/index.ts";
+import type { TaskRunState } from "./task-run.ts";
 import type { ToolCapability } from "./tool-system.ts";
 
 const planTaskSchema = Type.Object(
@@ -57,6 +58,154 @@ export interface TaskReflectionSnapshot {
 	evidence: readonly string[];
 	nextAction: string;
 	risks: readonly string[];
+}
+
+export type ReflectionVerificationStatus = "none" | "passed" | "failed";
+
+export interface ReflectionGuidanceInput {
+	goal?: string;
+	run?: TaskRunState;
+}
+
+export interface ReflectionGuidanceSummary {
+	changeSites: number;
+	changedPaths: readonly string[];
+	verification: ReflectionVerificationStatus;
+	discrepancies: readonly string[];
+}
+
+export interface TaskReflectionDetails extends TaskReflectionSnapshot {
+	guidance?: ReflectionGuidanceSummary;
+}
+
+export interface ReflectionGuidance {
+	summary: ReflectionGuidanceSummary;
+	text: string;
+}
+
+export interface ReflectTaskToolOptions {
+	loadGuidance?: () => Promise<ReflectionGuidanceInput | undefined>;
+}
+
+const maxGuidanceGoalChars = 400;
+const maxGuidancePaths = 10;
+const maxGuidanceDiscrepancies = 5;
+
+function truncateGuidanceText(value: string, maxLength: number): string {
+	const normalized = value.replace(/\s+/g, " ").trim();
+	if (normalized.length <= maxLength) return normalized;
+	return `${normalized.slice(0, maxLength - 1)}…`;
+}
+
+function completedChanges(run: TaskRunState): number {
+	return run.evidence.filter(
+		(evidence) => evidence.kind === "change" && evidence.outcome === "completed",
+	).length;
+}
+
+function changedPaths(run: TaskRunState): string[] {
+	const paths: string[] = [];
+	for (const evidence of run.evidence) {
+		if (evidence.kind !== "change" || evidence.outcome !== "completed") continue;
+		const pathsMetadata = evidence.metadata?.paths;
+		if (!Array.isArray(pathsMetadata)) continue;
+		for (const path of pathsMetadata) {
+			if (typeof path === "string") paths.push(path);
+		}
+	}
+	return [...new Set(paths)];
+}
+
+function verificationAgainstCurrentState(
+	run: TaskRunState,
+): ReflectionVerificationStatus {
+	for (let index = run.evidence.length - 1; index >= 0; index--) {
+		const evidence = run.evidence[index];
+		if (
+			evidence?.kind === "verification" &&
+			evidence.subjectFingerprint === run.currentSubjectFingerprint
+		) {
+			return evidence.outcome === "passed" ? "passed" : "failed";
+		}
+	}
+	return "none";
+}
+
+export function buildReflectionGuidance(
+	plan: TaskPlanSnapshot | undefined,
+	input: ReflectionGuidanceInput,
+): ReflectionGuidance {
+	const run = input.run;
+	const changeSites = run === undefined ? 0 : completedChanges(run);
+	const paths = run === undefined ? [] : changedPaths(run);
+	const verification =
+		run === undefined ? "none" : verificationAgainstCurrentState(run);
+	const discrepancies: string[] = [];
+	if (plan !== undefined && run !== undefined) {
+		if (plan.verification.length > 0 && verification === "none") {
+			discrepancies.push(
+				`The plan declared ${plan.verification.length} verification criteria, but no verification evidence matches the current workspace state.`,
+			);
+		}
+		if (verification === "failed") {
+			discrepancies.push(
+				"The latest verification for the current workspace state failed.",
+			);
+		}
+		if (changeSites > plan.steps.length) {
+			discrepancies.push(
+				`${changeSites} change sites were recorded, but the plan declared only ${plan.steps.length} step(s).`,
+			);
+		}
+	}
+	const lines: string[] = ["Runtime fact check:"];
+	if (input.goal !== undefined) {
+		lines.push(
+			`- Original goal: ${truncateGuidanceText(input.goal, maxGuidanceGoalChars)}`,
+		);
+	}
+	if (plan !== undefined) {
+		lines.push(
+			`- Plan: ${plan.steps.length} steps, ${plan.verification.length} verification criteria${plan.risks.length > 0 ? `, ${plan.risks.length} risk(s)` : ""}.`,
+		);
+	}
+	if (run === undefined) {
+		lines.push("- No execution task is active, so no changes or verification are recorded.");
+	} else {
+		const pathsPreview = paths.slice(0, maxGuidancePaths).join(", ");
+		const pathsSuffix =
+			paths.length > maxGuidancePaths ? `, …(+${paths.length - maxGuidancePaths} more)` : "";
+		lines.push(
+			changeSites === 0
+				? "- Recorded changes: none."
+				: `- Recorded changes: ${changeSites} site(s) across ${paths.length} path(s): ${pathsPreview}${pathsSuffix}`,
+		);
+		const verificationText =
+			verification === "none"
+				? "none matches the current workspace state"
+				: verification === "passed"
+					? "passed against the current workspace state"
+					: "FAILED against the current workspace state";
+		lines.push(`- Verification: ${verificationText}.`);
+	}
+	if (discrepancies.length > 0) {
+		lines.push("- Facts that may indicate deviation:");
+		for (const discrepancy of discrepancies.slice(0, maxGuidanceDiscrepancies)) {
+			lines.push(`  * ${discrepancy}`);
+		}
+	}
+	lines.push(
+		"Compare these facts against the goal. If work is missing or off target, continue with tools and reflect again; otherwise proceed to finish_task.",
+	);
+	return {
+		summary: {
+			changeSites,
+			changedPaths: paths,
+			verification,
+			discrepancies,
+		},
+		text: lines.join("\n"),
+	};
 }
 
 export interface TaskDeliberationSnapshot {
@@ -191,7 +340,8 @@ export function createPlanTaskTool(
 
 export function createReflectTaskTool(
 	controller: TaskDeliberationController,
-): AgentTool<typeof reflectTaskSchema, TaskReflectionSnapshot> {
+	options: ReflectTaskToolOptions = {},
+): AgentTool<typeof reflectTaskSchema, TaskReflectionDetails> {
 	return {
 		name: "reflect_task",
 		label: "reflect task",
@@ -204,11 +354,29 @@ export function createReflectTaskTool(
 			if (!reflectionValidator.Check(rawInput)) {
 				throw new Error("reflect_task arguments failed execution-time validation");
 			}
-			const details = controller.recordReflection(rawInput);
+			const reflection = controller.recordReflection(rawInput);
+			const plan = controller.snapshot().plan;
+			let guidance: ReflectionGuidance | undefined;
+			if (options.loadGuidance) {
+				try {
+					const input = await options.loadGuidance();
+					if (input) guidance = buildReflectionGuidance(plan, input);
+				} catch {
+					// Guidance is advisory; recording the reflection must not fail because of it.
+				}
+			}
 			return {
-				content: [{ type: "text", text: `Reflection recorded: ${details.decision}` }],
-				details,
-			} satisfies AgentToolResult<TaskReflectionSnapshot>;
+				content: [
+					{
+						type: "text",
+						text: `Reflection recorded: ${reflection.decision}.${guidance === undefined ? "" : `\n${guidance.text}`}`,
+					},
+				],
+				details: {
+					...reflection,
+					...(guidance === undefined ? {} : { guidance: guidance.summary }),
+				},
+			} satisfies AgentToolResult<TaskReflectionDetails>;
 		},
 	};
 }

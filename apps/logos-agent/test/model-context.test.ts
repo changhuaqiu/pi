@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AgentMessage } from "../../../packages/agent/src/index.ts";
+import { createContextManager } from "../src/context-manager.ts";
 import {
 	assembleModelContext,
-	createToolResultContextProjector,
 	type ModelContextContributor,
 } from "../src/model-context.ts";
 
@@ -117,16 +117,30 @@ test("tool result projection retains the recent working set and compacts older o
 	const latestCommand = toolResultMessage("run_command", `npm run check exited with exit code 0\n${"c".repeat(80)}`, 3);
 	const messages = [oldRead, oldSearch, latestCommand];
 
-	const project = createToolResultContextProjector({
-		maxRetainedBytes: 120,
-		keepRecent: 1,
+	const manager = createContextManager({
+		maxRetainedToolResultBytes: 120,
+		keepRecentToolResults: 1,
 		compactableToolNames: new Set(["read_file", "grep", "run_command"]),
 	});
-	const projection = project(messages);
+	const projection = manager.prepare(messages);
 
-	assert.equal(projection.stats.compactedResults, 2);
-	assert.equal(projection.stats.newlyCompactedResults, 2);
-	assert.equal(projection.stats.retainedResults, 1);
+	assert.equal(projection.toolResults.compactedResults, 2);
+	assert.equal(projection.toolResults.newlyCompactedResults, 2);
+	assert.equal(projection.toolResults.retainedResults, 1);
+	assert.equal(projection.sequence, 1);
+	assert.equal(projection.sourceMessageCount, 3);
+	assert.equal(projection.projectedMessageCount, 3);
+	assert.deepEqual(
+		projection.changes.map((change) => ({
+			toolName: change.toolName,
+			reason: change.reason,
+			newlyCompacted: change.newlyCompacted,
+		})),
+		[
+			{ toolName: "read_file", reason: "budget", newlyCompacted: true },
+			{ toolName: "grep", reason: "budget", newlyCompacted: true },
+		],
+	);
 	assert.equal(projection.messages[2], latestCommand);
 	for (const index of [0, 1]) {
 		const message = projection.messages[index];
@@ -144,27 +158,27 @@ test("tool result projection retains the recent working set and compacts older o
 });
 
 test("tool result projection batches changes and keeps prior replacements stable", () => {
-	const project = createToolResultContextProjector({
-		maxRetainedBytes: 250,
-		keepRecent: 1,
+	const manager = createContextManager({
+		maxRetainedToolResultBytes: 250,
+		keepRecentToolResults: 1,
 		compactableToolNames: new Set(["read_file"]),
 	});
 	const first = toolResultMessage("read_file", "a".repeat(100), 1);
 	const second = toolResultMessage("read_file", "b".repeat(100), 2);
 	const third = toolResultMessage("read_file", "c".repeat(100), 3);
-	const firstProjection = project([first, second, third]);
-	assert.equal(firstProjection.stats.newlyCompactedResults, 2);
+	const firstProjection = manager.prepare([first, second, third]);
+	assert.equal(firstProjection.toolResults.newlyCompactedResults, 2);
 
 	const fourth = toolResultMessage("read_file", "d".repeat(100), 4);
-	const stableProjection = project([first, second, third, fourth]);
-	assert.equal(stableProjection.stats.newlyCompactedResults, 0);
+	const stableProjection = manager.prepare([first, second, third, fourth]);
+	assert.equal(stableProjection.toolResults.newlyCompactedResults, 0);
 	assert.deepEqual(stableProjection.messages[0], firstProjection.messages[0]);
 	assert.deepEqual(stableProjection.messages[1], firstProjection.messages[1]);
 
 	const fifth = toolResultMessage("read_file", "e".repeat(100), 5);
-	const nextBatch = project([first, second, third, fourth, fifth]);
-	assert.equal(nextBatch.stats.newlyCompactedResults, 2);
-	assert.equal(nextBatch.stats.compactedResults, 4);
+	const nextBatch = manager.prepare([first, second, third, fourth, fifth]);
+	assert.equal(nextBatch.toolResults.newlyCompactedResults, 2);
+	assert.equal(nextBatch.toolResults.compactedResults, 4);
 	assert.equal(nextBatch.messages[4], fifth);
 });
 
@@ -177,12 +191,12 @@ test("tool result projection preserves failure semantics and a bounded recovery 
 	);
 	const latest = toolResultMessage("read_file", "latest source", 2);
 
-	const project = createToolResultContextProjector({
-		maxRetainedBytes: 1,
-		keepRecent: 1,
+	const manager = createContextManager({
+		maxRetainedToolResultBytes: 1,
+		keepRecentToolResults: 1,
 		compactableToolNames: new Set(["run_command", "read_file"]),
 	});
-	const projection = project([oldFailure, latest]);
+	const projection = manager.prepare([oldFailure, latest]);
 	const compacted = projection.messages[0];
 	assert.equal(compacted?.role, "toolResult");
 	if (compacted?.role !== "toolResult") assert.fail("expected tool result");
@@ -198,15 +212,15 @@ test("tool result projection leaves stateful edit protocol results unchanged", (
 	const proposal = toolResultMessage("propose_patch", `${"proposal".repeat(100)}`, 1);
 	const latest = toolResultMessage("read_file", "latest source", 2);
 
-	const project = createToolResultContextProjector({
-		maxRetainedBytes: 1,
-		keepRecent: 0,
+	const manager = createContextManager({
+		maxRetainedToolResultBytes: 1,
+		keepRecentToolResults: 0,
 		compactableToolNames: new Set(["read_file"]),
 	});
-	const projection = project([proposal, latest]);
+	const projection = manager.prepare([proposal, latest]);
 
 	assert.equal(projection.messages[0], proposal);
-	assert.equal(projection.stats.compactedResults, 1);
+	assert.equal(projection.toolResults.compactedResults, 1);
 });
 
 test("large graph exploration is retained once and compacted on later provider requests", () => {
@@ -216,19 +230,20 @@ test("large graph exploration is retained once and compacted on later provider r
 		toolResultMessage("read_file", "b".repeat(50_000), 3),
 		toolResultMessage("read_file", "c".repeat(50_000), 4),
 	];
-	const project = createToolResultContextProjector({
-		maxRetainedBytes: 128 * 1024,
-		keepRecent: 2,
+	const manager = createContextManager({
+		maxRetainedToolResultBytes: 128 * 1024,
+		keepRecentToolResults: 2,
 		compactableToolNames: new Set(["read_file"]),
 		compactAfterUseToolNames: new Set(["codegraph_explore"]),
 	});
 
-	const firstProjection = project([graph, ...oldReads]);
+	const firstProjection = manager.prepare([graph, ...oldReads]);
 	assert.equal(firstProjection.messages[0], graph);
-	assert.equal(firstProjection.stats.compactedResults, 1);
+	assert.equal(firstProjection.toolResults.compactedResults, 1);
 
-	const laterProjection = project([graph, ...oldReads, userMessage("continue", 5)]);
-	assert.equal(laterProjection.stats.compactedResults, 2);
+	const laterProjection = manager.prepare([graph, ...oldReads, userMessage("continue", 5)]);
+	assert.equal(laterProjection.toolResults.compactedResults, 2);
+	assert.equal(laterProjection.changes[0]?.reason, "after-use");
 	const compacted = laterProjection.messages[0];
 	assert.equal(compacted?.role, "toolResult");
 	if (compacted?.role !== "toolResult") assert.fail("expected tool result");
@@ -245,18 +260,30 @@ test("compacted CodeGraph results retain bounded structured anchors", () => {
 	const graph: AgentMessage = {
 		...original,
 		details: {
+			operation: "node",
+			availability: "ready",
+			freshness: "fresh",
+			truncated: false,
+			reused: false,
+			resultKey: "node-result",
+			resultBytes: 5_848,
+			sourceBytes: 5_848,
+			resultCount: 52,
+			fileCount: 1,
 			anchors: [{ name: "findReusableImplementation", file: longPath, line: 42 }],
 		},
 	};
-	const project = createToolResultContextProjector({
+	const manager = createContextManager({
 		compactableToolNames: new Set(),
 		compactAfterUseToolNames: new Set(["codegraph_search"]),
 	});
-	project([graph]);
-	const later = project([graph, userMessage("continue", 2)]).messages[0];
+	manager.prepare([graph]);
+	const later = manager.prepare([graph, userMessage("continue", 2)]).messages[0];
 	assert.equal(later?.role, "toolResult");
 	if (later?.role !== "toolResult") assert.fail("expected tool result");
 	const text = later.content[0]?.type === "text" ? later.content[0].text : "";
+	assert.match(text, /facts=operation=node; availability=ready; freshness=fresh/);
+	assert.match(text, /resultCount=52; fileCount=1; anchorsShown=1/);
 	assert.match(text, /anchors=findReusableImplementation@src\//);
 	assert.match(text, /target\.ts:42/);
 });

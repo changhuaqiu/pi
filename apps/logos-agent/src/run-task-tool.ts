@@ -46,7 +46,7 @@ const runTaskSchema = Type.Object(
 	{
 		task: Type.Union(
 			[Type.Literal("logos_agent_test"), Type.Literal("logos_agent_typecheck")],
-			{ description: "Fixed validation task to execute after explicit user approval" },
+			{ description: "Fixed Logos Agent validation task to execute" },
 		),
 	},
 	{ additionalProperties: false },
@@ -501,7 +501,7 @@ export function createRunTaskTool(
 		name: "run_task",
 		label: "run validation task",
 		description:
-			"Run one fixed Logos Agent validation task after explicit user approval. This tool does not accept command strings, arguments, cwd, environment variables, or arbitrary executables.",
+			"Run one fixed Logos Agent test or typecheck task under the active tool permission. This tool does not accept command strings, arguments, cwd, environment variables, or arbitrary executables.",
 		parameters: runTaskSchema,
 		executionMode: "sequential",
 		async execute(_toolCallId, rawInput, signal, onUpdate) {

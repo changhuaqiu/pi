@@ -8,6 +8,7 @@ import {
 } from "../src/session-task-run-journal.ts";
 import {
 	InMemoryTaskRunJournal,
+	previewAssurance,
 	TaskRunController,
 	TaskRunError,
 	type TaskRunControllerOptions,
@@ -188,6 +189,41 @@ test("a later failed verification invalidates an earlier pass", async () => {
 	});
 
 	assert.equal(finished.assurance, "unverified");
+});
+
+test("previewAssurance reports what a success finish would record", async () => {
+	const { controller } = createController();
+	const run = await controller.start({
+		sessionId: "session-1",
+		goal: "Preview the assurance",
+		manifest,
+	});
+	await controller.apply(run.id, {
+		type: "evidence",
+		evidence: {
+			kind: "change",
+			sourceId: "change-1",
+			outcome: "completed",
+			subjectFingerprint: "subject-1",
+		},
+	});
+	assert.equal(previewAssurance(await controller.get(run.id)), "unverified");
+	await controller.apply(run.id, {
+		type: "evidence",
+		evidence: {
+			kind: "verification",
+			sourceId: "verification-1",
+			outcome: "passed",
+			subjectFingerprint: "subject-1",
+		},
+	});
+	const previewed = await controller.get(run.id);
+	assert.equal(previewAssurance(previewed), "verified");
+	const finished = await controller.apply(run.id, {
+		type: "finish",
+		conclusion: "success",
+	});
+	assert.equal(finished.assurance, previewAssurance(previewed));
 });
 
 test("TaskRun attributes successful network queries", async () => {
