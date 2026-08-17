@@ -38,3 +38,5 @@ A resolved tool promise does not necessarily mean the operation succeeded. Tools
 This change does not introduce a universal outcome taxonomy, recovery-action schema, presentation DSL, permission profile framework, or a second execution runtime. Add one of those only after a concrete repeated failure demonstrates that the current seam cannot express the required behavior.
 
 Large-result persistence is also deferred. The next implementation should copy the proven shape: retain the governed full output outside provider messages and put a stable preview/reference into provider context. It should not silently discard output or duplicate full output in both `content` and `details`.
+
+Business capabilities such as deployment and task processing extend this rule through `ManagedToolDescriptor`; they do not enter Harness or create a parallel executor. See [business-tool-modules.md](business-tool-modules.md) for the design and staged adoption criteria.
