@@ -27,6 +27,7 @@ TUI 提供：
 
 交付前的运行时事实引导（只引导，不拦截；设计依据与完整协议见 [agent-architecture.md](./agent-architecture.md)）：
 
+- `plan_task`、`reflect_task` 和 `finish_task` 是复杂任务的可选检查点，不是执行许可。简单修改可以在适度检查后直接结束；只读分析不为了完成流程而运行测试。真正的硬约束仍由工具权限、审批、路径和命令策略承担。
 - `reflect_task` 的返回值附带运行时事实包：用户原始目标（原话，非 plan 转述）、plan 声明的步骤与验证准则、已记录的变更路径、当前指纹下的验证状态，以及可机械计算的事实差（如声明了验证准则但当前状态无验证证据、变更数超过计划步骤数）。事实包由运行时从 TaskRun 证据装配；发现偏离的是模型，揭示事实的是运行时。
 - `finish_task` 的返回值附带 `previewAssurance` 计算的保障级别，提示最终总结如实说明验证边界；该级别与最终入账的 assurance 使用同一判据。
 - `reflect_task` 的结果以 `tool_result` 证据入账，metadata 携带 decision 与事实差摘要；`apply_edit`/`create_directories` 的 change 证据补充记录变更路径。

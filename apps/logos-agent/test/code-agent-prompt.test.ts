@@ -10,10 +10,18 @@ test("core prompt defines an end-to-end coding agent contract", () => {
 	assert.match(codeAgentSystemPrompt, /investigate, implement, verify/);
 	assert.match(codeAgentSystemPrompt, /Do not stop after describing a plan/);
 	assert.match(codeAgentSystemPrompt, /read authoritative files before editing/);
+	assert.match(codeAgentSystemPrompt, /prefer structural code-intelligence tools/);
+	assert.match(codeAgentSystemPrompt, /Use text search for exact strings/);
 	assert.match(codeAgentSystemPrompt, /use its actual output to diagnose the cause/);
 	assert.match(codeAgentSystemPrompt, /rerun the relevant verification/);
+	assert.match(codeAgentSystemPrompt, /Read-only analysis and explanation do not need a test ritual/);
+	assert.match(codeAgentSystemPrompt, /do not run broader checks merely to complete a workflow/);
 	assert.match(codeAgentSystemPrompt, /state exactly what was not run and why/);
 	assert.match(codeAgentSystemPrompt, /Review the final diff and behavior/);
+	assert.match(codeAgentSystemPrompt, /Write for a person, not an execution log/);
+	assert.match(codeAgentSystemPrompt, /Keep simple results to one or two short paragraphs/);
+	assert.match(codeAgentSystemPrompt, /Do not replay the tool sequence/);
+	assert.match(codeAgentSystemPrompt, /not as mandatory report sections/);
 	assert.match(codeAgentSystemPrompt, /Never claim that a file changed/);
 });
 

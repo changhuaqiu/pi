@@ -258,7 +258,7 @@ export function createLogosToolDescriptors(
 			defaultPermission: "allow",
 			context: { maxBytes: 8 * 1024 },
 			guidance: [
-				"Before any workspace mutation or process execution, call plan_task with a bounded plan. Do not call plan_task for read-only analysis or answers; they end with a normal assistant response.",
+				"Use plan_task when a workspace change is multi-step, risky, or needs an explicit checkpoint. Skip it for read-only analysis, simple edits, and commands used only to inspect current state.",
 			],
 		},
 		{
@@ -267,7 +267,7 @@ export function createLogosToolDescriptors(
 			defaultPermission: "allow",
 			context: { maxBytes: 8 * 1024 },
 			guidance: [
-				"After side effects or verification, call reflect_task with concrete evidence. Use decision=ready only when the result is complete; use continue or revise when more work remains.",
+				"Use reflect_task when new evidence requires reassessment, a check failed, or a multi-step implementation may have drifted. Skip it when direct review is sufficient.",
 			],
 		},
 		{
@@ -277,8 +277,8 @@ export function createLogosToolDescriptors(
 			context: { maxBytes: 8 * 1024 },
 			guidance: [
 				"Ordinary conversation, greetings, explanations, and read-only answers end with a normal assistant response. Do not call plan_task, reflect_task, or finish_task for those turns.",
-				"After entering an execution task through an edit proposal, a workspace mutation, or process execution, a normal response stop does not complete that task. Call finish_task as the only tool call when execution and verification are complete, then provide the concise final user-facing summary as normal assistant text without more tools.",
-				"Never stop after merely promising or announcing future work. Continue with the required tools instead. Call finish_task only after requested mutations succeeded and relevant verification was performed, or clearly state why verification was not applicable.",
+				"finish_task is an optional explicit completion checkpoint for longer execution tasks. Simple changes may end with a normal final response after proportionate review and verification.",
+				"Never stop after merely promising or announcing future work. Continue with the required tools instead. Run checks only when they add evidence for the request or the workspace changes, and state when no check was applicable.",
 			],
 		},
 		{
@@ -560,6 +560,9 @@ export function createLogosToolDescriptors(
 					maxBytes: CODEGRAPH_RESULT_BUDGET_BYTES,
 					history: "compact-after-use",
 				},
+				guidance: [
+					"For architecture, symbol relationships, callers/callees, cross-module flows, or refactor impact, start with the matching codegraph tool when the workspace index is available. Use grep for exact text and read_file to verify current source. Skip CodeGraph for small flat files or simple exact-text lookups.",
+				],
 			},
 			{
 				tool: createCodeGraphNodeTool(provider),

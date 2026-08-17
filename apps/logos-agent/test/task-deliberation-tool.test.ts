@@ -13,58 +13,19 @@ import type { ToolCapability } from "../src/tool-system.ts";
 const writeCapability: readonly ToolCapability[] = [
 	{ kind: "fs.write", scope: "workspace" },
 ];
-const completionCapability: readonly ToolCapability[] = [
-	{ kind: "task.complete", scope: "current-task-run" },
-];
-
-test("requires a plan before side effects", () => {
+test("planning and reflection remain advisory state rather than execution gates", () => {
 	const controller = new TaskDeliberationController();
 	controller.beginTurn();
-	assert.deepEqual(controller.beforeToolCall({ toolName: "apply_edit" }, writeCapability), {
-		block: true,
-		reason: "Create a task plan with plan_task before using apply_edit",
-	});
-});
-
-test("requires fresh reflection after side effects before completion", () => {
-	const controller = new TaskDeliberationController();
-	controller.recordPlan({
-			goal: "Change one file",
-			steps: ["Apply the edit"],
-			verification: ["Run the focused test"],
-	});
-	assert.equal(controller.beforeToolCall({ toolName: "apply_edit" }, writeCapability), undefined);
 	controller.afterToolResult(writeCapability);
-	assert.equal(
-		controller.beforeToolCall({ toolName: "finish_task" }, completionCapability)?.block,
-		true,
-	);
-
+	assert.deepEqual(controller.snapshot(), { reflectionRequired: true });
+	controller.recordPlan({ goal: "Simple edit", steps: ["Edit the file"] });
 	controller.recordReflection({
-			decision: "ready",
-			evidence: ["Focused test passed"],
-			nextAction: "Deliver the result",
+		decision: "ready",
+		evidence: ["Reviewed the current diff"],
+		nextAction: "Deliver",
 	});
-	assert.equal(
-			controller.beforeToolCall({ toolName: "finish_task" }, completionCapability),
-			undefined,
-	);
-});
-
-test("does not require a plan for read-only tools or simple completion", () => {
-	const controller = new TaskDeliberationController();
-	controller.beginTurn();
-	assert.equal(
-			controller.beforeToolCall(
-				{ toolName: "read_file" },
-				[{ kind: "fs.read", scope: "workspace" }],
-			),
-			undefined,
-	);
-	assert.equal(
-			controller.beforeToolCall({ toolName: "finish_task" }, completionCapability),
-			undefined,
-	);
+	assert.equal(controller.snapshot().reflectionRequired, false);
+	assert.deepEqual(controller.snapshot().plan?.verification, []);
 });
 
 test("records plans and reflections through their tools", async () => {
@@ -109,31 +70,8 @@ test("a later side effect invalidates a previously ready reflection", () => {
 	controller.afterToolResult(writeCapability);
 
 	assert.equal(controller.snapshot().reflection, undefined);
-	assert.equal(
-		controller.beforeToolCall({ toolName: "finish_task" }, completionCapability)?.block,
-		true,
-	);
+	assert.equal(controller.snapshot().reflectionRequired, true);
 });
-
-for (const decision of ["continue", "revise"] as const) {
-	test(`${decision} reflection cannot complete a planned task`, () => {
-		const controller = new TaskDeliberationController();
-		controller.recordPlan({
-			goal: "Change one file",
-			steps: ["Apply the edit"],
-			verification: ["Run the focused test"],
-		});
-		controller.recordReflection({
-			decision,
-			evidence: ["More work remains"],
-			nextAction: "Continue implementation",
-		});
-		assert.equal(
-			controller.beforeToolCall({ toolName: "finish_task" }, completionCapability)?.block,
-			true,
-		);
-	});
-}
 
 test("beginTurn clears plan and reflection from the previous task", () => {
 	const controller = new TaskDeliberationController();
@@ -150,10 +88,6 @@ test("beginTurn clears plan and reflection from the previous task", () => {
 	controller.beginTurn();
 
 	assert.deepEqual(controller.snapshot(), { reflectionRequired: false });
-	assert.equal(
-		controller.beforeToolCall({ toolName: "apply_edit" }, writeCapability)?.block,
-		true,
-	);
 });
 
 function runState(
@@ -290,6 +224,18 @@ test("guidance without an active run stays minimal", () => {
 	assert.equal(guidance.summary.verification, "none");
 	assert.deepEqual(guidance.summary.discrepancies, []);
 	assert.match(guidance.text, /No execution task is active/);
+});
+
+test("guidance does not demand verification when no workspace change was recorded", () => {
+	const plan: TaskPlanSnapshot = {
+		goal: "Analyze the architecture",
+		steps: ["Inspect module relationships"],
+		verification: ["Confirm the explanation against current source"],
+		risks: [],
+	};
+	const guidance = buildReflectionGuidance(plan, { run: runState([]) });
+	assert.deepEqual(guidance.summary.discrepancies, []);
+	assert.doesNotMatch(guidance.text, /no verification evidence/);
 });
 
 test("guidance truncates long goals and long path lists", () => {

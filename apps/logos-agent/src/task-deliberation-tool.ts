@@ -1,7 +1,6 @@
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import { type Static, Type } from "typebox";
 import { Compile } from "typebox/compile";
-import type { ToolCallEvent, ToolCallResult } from "../../../packages/agent/src/index.ts";
 import type { TaskRunState } from "./task-run.ts";
 import type { ToolCapability } from "./tool-system.ts";
 
@@ -12,10 +11,11 @@ const planTaskSchema = Type.Object(
 			minItems: 1,
 			maxItems: 12,
 		}),
-		verification: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), {
-			minItems: 1,
-			maxItems: 8,
-		}),
+		verification: Type.Optional(
+			Type.Array(Type.String({ minLength: 1, maxLength: 500 }), {
+				maxItems: 8,
+			}),
+		),
 		risks: Type.Optional(
 			Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 8 }),
 		),
@@ -142,7 +142,11 @@ export function buildReflectionGuidance(
 		run === undefined ? "none" : verificationAgainstCurrentState(run);
 	const discrepancies: string[] = [];
 	if (plan !== undefined && run !== undefined) {
-		if (plan.verification.length > 0 && verification === "none") {
+		if (
+			changeSites > 0 &&
+			plan.verification.length > 0 &&
+			verification === "none"
+		) {
 			discrepancies.push(
 				`The plan declared ${plan.verification.length} verification criteria, but no verification evidence matches the current workspace state.`,
 			);
@@ -252,7 +256,7 @@ export class TaskDeliberationController {
 		const plan = Object.freeze({
 			goal: normalizedText(input.goal),
 			steps: Object.freeze(normalizedList(input.steps)),
-			verification: Object.freeze(normalizedList(input.verification)),
+			verification: Object.freeze(normalizedList(input.verification ?? [])),
 			risks: Object.freeze(normalizedList(input.risks ?? [])),
 		} satisfies TaskPlanSnapshot);
 		this.plan = plan;
@@ -270,33 +274,6 @@ export class TaskDeliberationController {
 		this.reflection = reflection;
 		this.reflectionRequired = false;
 		return reflection;
-	}
-
-	beforeToolCall(
-		event: Pick<ToolCallEvent, "toolName">,
-		capabilities: readonly ToolCapability[],
-	): ToolCallResult | undefined {
-		if (isSideEffect(capabilities) && !this.plan) {
-			return {
-				block: true,
-				reason: `Create a task plan with plan_task before using ${event.toolName}`,
-			};
-		}
-		if (capabilities.some((capability) => capability.kind === "task.complete")) {
-			if (this.reflectionRequired) {
-				return {
-					block: true,
-					reason: "Reflect on the latest side effects with reflect_task before completing the task",
-				};
-			}
-			if (this.plan && this.reflection?.decision !== "ready") {
-				return {
-					block: true,
-					reason: "A planned task requires a final reflect_task decision of ready before finish_task",
-				};
-			}
-		}
-		return undefined;
 	}
 
 	afterToolResult(capabilities: readonly ToolCapability[]): void {
@@ -321,7 +298,7 @@ export function createPlanTaskTool(
 		name: "plan_task",
 		label: "plan task",
 		description:
-			"Record a concise execution plan before performing side effects. Plans must identify the goal, bounded steps, verification, and relevant risks.",
+			"Record a concise execution plan when a workspace change is multi-step, risky, or benefits from an explicit checkpoint. Skip it for read-only analysis and simple changes. Verification criteria are optional when no check is applicable.",
 		parameters: planTaskSchema,
 		executionMode: "sequential",
 		async execute(_toolCallId, rawInput, signal) {
@@ -346,7 +323,7 @@ export function createReflectTaskTool(
 		name: "reflect_task",
 		label: "reflect task",
 		description:
-			"Record an evidence-based checkpoint after side effects or verification. Use ready only when the requested outcome and relevant checks are complete.",
+			"Record an evidence-based checkpoint when a multi-step task needs reassessment, a check failed, or the implementation may have drifted from the goal. Skip it when a direct final review is sufficient.",
 		parameters: reflectTaskSchema,
 		executionMode: "sequential",
 		async execute(_toolCallId, rawInput, signal) {

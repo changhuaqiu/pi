@@ -438,9 +438,14 @@ test("native CodeGraph tools register through one bounded read-only provider", a
 	);
 	assert.ok(descriptor);
 	assert.equal(descriptor.context?.maxBytes, CODEGRAPH_RESULT_BUDGET_BYTES);
-	for (const candidate of codeGraphDescriptors) {
-		assert.equal(candidate.guidance, undefined);
-	}
+	assert.match(
+		codeGraphDescriptors.find((candidate) => candidate.tool.name === "codegraph_search")
+			?.guidance?.join("\n") ?? "",
+		/architecture, symbol relationships, callers\/callees/,
+	);
+	for (const candidate of codeGraphDescriptors.filter(
+		(candidate) => candidate.tool.name !== "codegraph_search",
+	)) assert.equal(candidate.guidance, undefined);
 	assert.match(descriptor.tool.description, /only when codegraph_node is insufficient/);
 	const audit = descriptor.audit?.summarizeInput({
 		query: "trace private implementation details",

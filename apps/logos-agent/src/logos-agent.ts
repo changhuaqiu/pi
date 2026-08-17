@@ -123,8 +123,6 @@ import {
 	runTaskCompletionLoop,
 	TaskCompletionTracker,
 	taskCompletionToolName,
-	taskCompletionContinuationPrompt,
-	taskLengthContinuationPrompt,
 	turnCompletionContinuationPrompt,
 	turnLengthContinuationPrompt,
 } from "./task-completion-tool.ts";
@@ -565,8 +563,6 @@ export class HarnessLogosAgent implements LogosAgent {
 		const toolSystem = new ToolSystem<LogosTool, LogosApprovalSubject>({
 			workspaceRoot: this.config.workspaceRoot,
 			permissionStore: this.toolPermissions,
-			guardToolCall: (context) =>
-				taskDeliberation.beforeToolCall(context, context.capabilities),
 			requestApproval: async (subject) => await this.requestApproval(subject),
 			createGenericApprovalSubject: createGenericLogosApprovalSubject,
 			recordAudit: async (record) => {
@@ -1299,10 +1295,7 @@ export class HarnessLogosAgent implements LogosAgent {
 			const completion = await runTaskCompletionLoop(
 				text,
 				async (prompt) => await this.harness.prompt(prompt),
-				(message) =>
-					this.turnTaskLifecycle.isTask()
-						? this.taskCompletion.isCompleted(message)
-						: isNormalTurnComplete(message),
+				(message) => isNormalTurnComplete(message),
 				async (attempt, maxAttempts, reason) => {
 					await this.emit({
 						type: "task_completion_retry",
@@ -1313,16 +1306,10 @@ export class HarnessLogosAgent implements LogosAgent {
 					});
 				},
 				taskAbortController.signal,
-				(reason: CompletionContinuationReason) => {
-					if (this.turnTaskLifecycle.isTask()) {
-						return reason === "length"
-							? taskLengthContinuationPrompt
-							: taskCompletionContinuationPrompt;
-					}
-					return reason === "length"
+				(reason: CompletionContinuationReason) =>
+					reason === "length"
 						? turnLengthContinuationPrompt
-						: turnCompletionContinuationPrompt;
-				},
+						: turnCompletionContinuationPrompt,
 			);
 			if (taskAbortController.signal.aborted) {
 				throw taskAbortController.signal.reason;

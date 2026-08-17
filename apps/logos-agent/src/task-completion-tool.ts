@@ -101,7 +101,7 @@ export function createFinishTaskTool(
 		name: taskCompletionToolName,
 		label: "finish task",
 		description:
-			"Declare that the current user task is genuinely complete. Call it only after requested actions and relevant verification are complete, and use it as the only tool call in that message. After the tool result, provide a concise final user-facing summary as normal assistant text without calling more tools.",
+			"Optionally record an explicit completion checkpoint for a longer execution task after requested actions and relevant verification are complete. Simple changes and read-only answers should end with a normal assistant response instead. Use this as the only tool call in its message, then answer the user's original goal naturally without more tools.",
 		parameters: finishTaskSchema,
 		executionMode: "sequential",
 		async execute(_toolCallId, rawInput, signal) {
@@ -128,7 +128,7 @@ export function createFinishTaskTool(
 				...(assurance === undefined
 					? []
 					: [`Assurance: ${assurance} — ${assuranceNotes[assurance]}.`]),
-				"Now provide the concise final user-facing summary as normal assistant text. Do not call another tool.",
+				"Now answer the user's original request naturally as normal assistant text. Do not mechanically restate the summary, verification, assurance, or task state, and do not call another tool.",
 			].join(" ");
 			return {
 				content: [{ type: "text", text }],

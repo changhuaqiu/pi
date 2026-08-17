@@ -58,7 +58,7 @@ function finalSummaryMessage(): AssistantMessage {
 	};
 }
 
-test("finish_task records bounded details and requests a normal final summary", async () => {
+test("finish_task records bounded details and requests a natural final answer", async () => {
 	const tool = createFinishTaskTool();
 	const result = await tool.execute(
 		"finish-1",
@@ -68,7 +68,9 @@ test("finish_task records bounded details and requests a normal final summary", 
 	);
 
 	assert.equal(result.terminate, undefined);
-	assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /final user-facing summary/);
+	const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+	assert.match(text, /answer the user's original request naturally/);
+	assert.match(text, /Do not mechanically restate/);
 	assert.deepEqual(result.details, {
 		stage: "completed",
 		summary: "Implemented the fix",
@@ -87,7 +89,7 @@ test("finish_task appends the runtime assurance level to the result", async () =
 		);
 		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
 		assert.match(text, new RegExp(`Assurance: ${assurance} — `));
-		assert.match(text, /final user-facing summary/);
+		assert.match(text, /answer the user's original request naturally/);
 		assert.equal(result.details.assurance, assurance);
 	}
 });
