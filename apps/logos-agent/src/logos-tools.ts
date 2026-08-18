@@ -1,3 +1,5 @@
+import { stripVTControlCharacters } from "node:util";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	createAskUserTool,
 	summarizeQuestionForAudit,
@@ -93,40 +95,96 @@ export type LogosApprovalSubject =
 	| { kind: "task"; task: RunTaskApprovalSummary }
 	| { kind: "command"; command: ControlledCommandApprovalSummary }
 	| { kind: "process_stop"; process: ControlledCommandProcessSummary }
+	| OperationApprovalSubject
 	| {
 			kind: "tool";
 			toolName: string;
 			capabilities: readonly ToolCapability[];
 	  };
 
-export type LogosTool =
-	| ReturnType<typeof createFinishTaskTool>
-	| ReturnType<typeof createPlanTaskTool>
-	| ReturnType<typeof createReflectTaskTool>
-	| ReturnType<typeof createAskUserTool>
-	| ReturnType<typeof createWorkspaceInfoTool>
-	| ReturnType<typeof createListFilesTool>
-	| ReturnType<typeof createReadFileTool>
-	| ReturnType<typeof createGrepTool>
-	| ReturnType<typeof createCodeGraphSearchTool>
-	| ReturnType<typeof createCodeGraphNodeTool>
-	| ReturnType<typeof createCodeGraphExploreTool>
-	| ReturnType<typeof createCodeGraphImpactTool>
-	| ReturnType<typeof createProposePatchTool>
-	| ReturnType<typeof createProposeCreateFileTool>
-	| ReturnType<typeof createProposeDeleteFileTool>
-	| ReturnType<typeof createApplyEditTool>
-	| ReturnType<typeof createDirectoriesTool>
-	| ReturnType<typeof createRunCommandTool>
-	| ReturnType<typeof createCommandStatusTool>
-	| ReturnType<typeof createStopCommandTool>
-	| ReturnType<typeof createGitStatusTool>
-	| ReturnType<typeof createGitDiffTool>
-	| ReturnType<typeof createGitLogTool>
-	| ReturnType<typeof createGitShowTool>
-	| ReturnType<typeof createGitBlameTool>
-	| ReturnType<typeof createRunTaskTool>
-	| ReturnType<typeof createWebSearchTool>;
+export interface OperationApprovalSubject {
+	kind: "operation";
+	title: string;
+	action: string;
+	target: string;
+	facts: readonly {
+		label: string;
+		value: string;
+	}[];
+	warning?: string;
+}
+
+/**
+ * Logos uses the framework AgentTool interface as its registration seam so a
+ * business tool does not need to join a central union of every known tool.
+ */
+export type LogosTool = AgentTool;
+
+const maxOperationApprovalFacts = 12;
+const maxOperationApprovalBytes = 8 * 1024;
+
+function boundedApprovalText(
+	value: string,
+	label: string,
+	maxBytes: number,
+	workspaceRoot: string,
+): string {
+	const normalized = stripVTControlCharacters(value)
+		.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, "")
+		.normalize("NFKC");
+	const sanitized = redactSensitiveText(normalized, workspaceRoot)
+		.replace(/\s+/g, " ")
+		.trim();
+	if (!sanitized) throw new Error(`${label} must contain visible text`);
+	const buffer = Buffer.from(sanitized, "utf8");
+	if (buffer.length <= maxBytes) return sanitized;
+	const suffix = "…";
+	const contentBytes = maxBytes - Buffer.byteLength(suffix, "utf8");
+	let end = Math.max(0, contentBytes);
+	while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+	return `${buffer.subarray(0, end).toString("utf8")}${suffix}`;
+}
+
+export function governLogosApprovalSubject(
+	subject: LogosApprovalSubject,
+	workspaceRoot: string,
+): LogosApprovalSubject {
+	if (subject.kind !== "operation") return subject;
+	const governed: OperationApprovalSubject = {
+		kind: "operation",
+		title: boundedApprovalText(subject.title, "Operation approval title", 160, workspaceRoot),
+		action: boundedApprovalText(subject.action, "Operation approval action", 120, workspaceRoot),
+		target: boundedApprovalText(subject.target, "Operation approval target", 500, workspaceRoot),
+		facts: subject.facts.slice(0, maxOperationApprovalFacts).map((fact) => ({
+			label: boundedApprovalText(
+				fact.label,
+				"Operation approval fact label",
+				80,
+				workspaceRoot,
+			),
+			value: boundedApprovalText(
+				fact.value,
+				"Operation approval fact value",
+				320,
+				workspaceRoot,
+			),
+		})),
+		...(subject.warning === undefined
+			? {}
+			: {
+					warning: boundedApprovalText(
+						subject.warning,
+						"Operation approval warning",
+						800,
+						workspaceRoot,
+					),
+				}),
+	};
+	if (Buffer.byteLength(JSON.stringify(governed), "utf8") > maxOperationApprovalBytes) {
+		throw new Error(`Operation approval subject exceeds ${maxOperationApprovalBytes} bytes`);
+	}
+	return governed;
+}
 
 export interface LogosToolDependencies {
 	workspaceRoot: string;

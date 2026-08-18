@@ -1769,6 +1769,8 @@ export class LogosAgentTui {
 						? "Process stop"
 					: subject.kind === "task"
 						? "Task"
+						: subject.kind === "operation"
+							? "Operation"
 						: "Tool";
 			this.statusOverride = chalk.bold.yellow(
 				`${approvalKind} review · y approve once · n/Esc reject · arrows/PgUp/PgDn inspect`,

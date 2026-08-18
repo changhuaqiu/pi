@@ -10,6 +10,7 @@ import {
 	createResultAuditRecord,
 	DEFAULT_MAX_TOOL_RESULT_BYTES,
 	freezeToolInput,
+	redactSensitiveText,
 	redactToolResult,
 	sanitizeAuditInput,
 	type ToolAuditRecord,
@@ -17,23 +18,54 @@ import {
 
 export type ToolPermission = "allow" | "ask" | "deny";
 
-export type ToolCapabilityKind =
-	| "task.complete"
-	| "task.plan"
-	| "task.reflect"
-	| "workspace.inspect"
-	| "code.inspect"
-	| "user.interact"
-	| "fs.read"
-	| "fs.write"
-	| "fs.delete"
-	| "edit.propose"
-	| "git.read"
-	| "network.search"
-	| "network.access"
-	| "process.execute"
-	| "process.inspect"
-	| "process.terminate";
+const coreToolCapabilityKinds = [
+	"task.complete",
+	"task.plan",
+	"task.reflect",
+	"workspace.inspect",
+	"code.inspect",
+	"user.interact",
+	"fs.read",
+	"fs.write",
+	"fs.delete",
+	"edit.propose",
+	"git.read",
+	"network.search",
+	"network.access",
+	"process.execute",
+	"process.inspect",
+	"process.terminate",
+] as const;
+
+export type CoreToolCapabilityKind = (typeof coreToolCapabilityKinds)[number];
+declare const businessToolCapabilityKindBrand: unique symbol;
+export type BusinessToolCapabilityKind = string & {
+	readonly [businessToolCapabilityKindBrand]: true;
+};
+export type ToolCapabilityKind = CoreToolCapabilityKind | BusinessToolCapabilityKind;
+
+const coreToolCapabilityKindSet = new Set<string>(coreToolCapabilityKinds);
+const businessToolCapabilityKindPattern =
+	/^business\.[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)+$/;
+
+function isValidToolCapabilityKind(kind: unknown): kind is ToolCapabilityKind {
+	return (
+		typeof kind === "string" &&
+		kind.length <= 200 &&
+		(coreToolCapabilityKindSet.has(kind) || businessToolCapabilityKindPattern.test(kind))
+	);
+}
+
+export function defineBusinessToolCapability(
+	kind: string,
+): BusinessToolCapabilityKind {
+	if (!businessToolCapabilityKindPattern.test(kind) || kind.length > 200) {
+		throw new Error(
+			"Business tool capability must use business.<domain>.<action> lowercase dot notation",
+		);
+	}
+	return kind as BusinessToolCapabilityKind;
+}
 
 export interface ToolCapability {
 	readonly kind: ToolCapabilityKind;
@@ -114,6 +146,11 @@ export type ToolAuthorizationPreparation<TApprovalSubject> =
 	| { kind: "deny"; reason: string };
 
 export interface ToolAuthorizationPolicy<TApprovalSubject> {
+	/**
+	 * Runs before permission approval. It may load and validate an existing
+	 * prepared operation, but must not create externally visible side effects.
+	 * The tool's execute method remains the only business-operation executor.
+	 */
 	prepare(
 		context: ToolAuthorizationContext,
 	): ToolAuthorizationPreparation<TApprovalSubject> | Promise<ToolAuthorizationPreparation<TApprovalSubject>>;
@@ -145,6 +182,7 @@ export interface ToolSystemOptions<TApprovalSubject> {
 	globalMaxResultBytes?: number;
 	requestApproval(subject: TApprovalSubject): Promise<boolean>;
 	createGenericApprovalSubject(context: ToolAuthorizationContext): TApprovalSubject;
+	governApprovalSubject?(subject: TApprovalSubject): TApprovalSubject;
 	recordAudit(record: ToolAuditRecord): Promise<void>;
 	guardToolCall?(
 		context: ToolAuthorizationContext,
@@ -204,6 +242,7 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 	private readonly globalMaxResultBytes: number;
 	private readonly requestApproval: ToolSystemOptions<TApprovalSubject>["requestApproval"];
 	private readonly createGenericApprovalSubject: ToolSystemOptions<TApprovalSubject>["createGenericApprovalSubject"];
+	private readonly governApprovalSubject: (subject: TApprovalSubject) => TApprovalSubject;
 	private readonly recordAudit: ToolSystemOptions<TApprovalSubject>["recordAudit"];
 	private readonly guardToolCall?: ToolSystemOptions<TApprovalSubject>["guardToolCall"];
 	private readonly descriptors = new Map<string, ManagedToolDescriptor<TTool, TApprovalSubject>>();
@@ -218,6 +257,7 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 		}
 		this.requestApproval = options.requestApproval;
 		this.createGenericApprovalSubject = options.createGenericApprovalSubject;
+		this.governApprovalSubject = options.governApprovalSubject ?? ((subject) => subject);
 		this.recordAudit = options.recordAudit;
 		this.guardToolCall = options.guardToolCall;
 	}
@@ -245,6 +285,9 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 			throw new Error(`Tool must declare at least one capability: ${tool.name}`);
 		}
 		for (const capability of descriptor.capabilities) {
+			if (!isValidToolCapabilityKind(capability.kind)) {
+				throw new Error(`Invalid tool capability kind for ${tool.name}: ${capability.kind}`);
+			}
 			validatePromptMetadata(capability.scope, `Capability scope for ${tool.name}`, 500);
 		}
 		for (const instruction of descriptor.guidance ?? []) {
@@ -367,25 +410,52 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 			input: event.input,
 			capabilities: descriptor.capabilities,
 		};
+		const safeReason = (reason: string): string =>
+			redactSensitiveText(reason, this.workspaceRoot)
+				.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ")
+				.trim()
+				.slice(0, 500);
+		const recordDecision = async (
+			decision: "allowed" | "blocked",
+			options: {
+				approval?: "approved" | "rejected" | "failed";
+				reason?: string;
+			} = {},
+		): Promise<void> => {
+			await this.recordAudit(
+				createDecisionAuditRecord(
+					event.toolCallId,
+					event.toolName,
+					inputSummary,
+					decision,
+					{
+						...(options.approval === undefined
+							? {}
+							: { approval: options.approval }),
+						...(options.reason === undefined
+							? {}
+							: { reason: safeReason(options.reason) }),
+					},
+				),
+			);
+		};
 		let permission = this.resolvePermission(descriptor);
 		if (permission === "deny") {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", {
+				reason: `Tool permission denied: ${event.toolName}`,
+			});
 			return { block: true, reason: `Tool permission denied: ${event.toolName}` };
 		}
 		try {
 			const guardResult = await this.guardToolCall?.(authorizationContext);
 			if (guardResult?.block) {
-				await this.recordAudit(
-					createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-				);
+				await recordDecision("blocked", {
+					reason: guardResult.reason ?? `Tool guard blocked: ${event.toolName}`,
+				});
 				return guardResult;
 			}
 		} catch {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", { reason: `Tool guard failed: ${event.toolName}` });
 			return { block: true, reason: `Tool guard failed: ${event.toolName}` };
 		}
 		let preparation: ToolAuthorizationPreparation<TApprovalSubject> = { kind: "ready" };
@@ -394,24 +464,22 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 				preparation = await descriptor.authorization.prepare(authorizationContext);
 			}
 		} catch {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", {
+				reason: `Tool authorization failed: ${event.toolName}`,
+			});
 			return { block: true, reason: `Tool authorization failed: ${event.toolName}` };
 		}
 		if (preparation.kind === "deny") {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", { reason: preparation.reason });
 			return { block: true, reason: preparation.reason };
 		}
 
 		let approvalGranted = false;
 		permission = this.resolvePermission(descriptor);
 		if (permission === "deny") {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", {
+				reason: `Tool permission denied: ${event.toolName}`,
+			});
 			return { block: true, reason: `Tool permission denied: ${event.toolName}` };
 		}
 		if (permission === "ask") {
@@ -420,17 +488,19 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 				const subject = preparation.prepareApprovalSubject
 					? await preparation.prepareApprovalSubject()
 					: preparation.approvalSubject ?? this.createGenericApprovalSubject(authorizationContext);
-				approved = await this.requestApproval(subject);
+				approved = await this.requestApproval(this.governApprovalSubject(subject));
 			} catch {
-				await this.recordAudit(
-					createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-				);
+				await recordDecision("blocked", {
+					approval: "failed",
+					reason: `Tool approval failed: ${event.toolName}`,
+				});
 				return { block: true, reason: `Tool approval failed: ${event.toolName}` };
 			}
 			if (!approved) {
-				await this.recordAudit(
-					createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-				);
+				await recordDecision("blocked", {
+					approval: "rejected",
+					reason: "User rejected the requested operation",
+				});
 				return { block: true, reason: "User rejected the requested operation" };
 			}
 			approvalGranted = true;
@@ -438,9 +508,10 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 
 		permission = this.resolvePermission(descriptor);
 		if (permission === "deny" || (permission === "ask" && !approvalGranted)) {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", {
+				...(approvalGranted ? { approval: "approved" as const } : {}),
+				reason: `Tool permission changed before execution: ${event.toolName}`,
+			});
 			return {
 				block: true,
 				reason: `Tool permission changed before execution: ${event.toolName}`,
@@ -450,16 +521,18 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 		try {
 			await preparation.grant?.();
 		} catch {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", {
+				...(approvalGranted ? { approval: "approved" as const } : {}),
+				reason: `Tool authorization grant failed: ${event.toolName}`,
+			});
 			return { block: true, reason: `Tool authorization grant failed: ${event.toolName}` };
 		}
 		permission = this.resolvePermission(descriptor);
 		if (permission === "deny" || (permission === "ask" && !approvalGranted)) {
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", {
+				...(approvalGranted ? { approval: "approved" as const } : {}),
+				reason: `Tool permission changed during authorization: ${event.toolName}`,
+			});
 			return {
 				block: true,
 				reason: `Tool permission changed during authorization: ${event.toolName}`,
@@ -467,15 +540,16 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 		}
 
 		this.startedAt.set(event.toolCallId, Date.now());
-		await this.recordAudit(
-			createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "allowed"),
-		);
+		await recordDecision("allowed", {
+			...(approvalGranted ? { approval: "approved" as const } : {}),
+		});
 		permission = this.resolvePermission(descriptor);
 		if (permission === "deny" || (permission === "ask" && !approvalGranted)) {
 			this.startedAt.delete(event.toolCallId);
-			await this.recordAudit(
-				createDecisionAuditRecord(event.toolCallId, event.toolName, inputSummary, "blocked"),
-			);
+			await recordDecision("blocked", {
+				...(approvalGranted ? { approval: "approved" as const } : {}),
+				reason: `Tool permission changed before execution: ${event.toolName}`,
+			});
 			return {
 				block: true,
 				reason: `Tool permission changed before execution: ${event.toolName}`,

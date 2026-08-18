@@ -6,6 +6,7 @@ import {
 	LogosSessionPicker,
 	LogosToolPolicyPicker,
 } from "../src/logos-tui-components.ts";
+import { governLogosApprovalSubject } from "../src/logos-tools.ts";
 
 test("approval card makes the complete diff reachable without exceeding width", () => {
 	const diff = Array.from({ length: 50 }, (_, index) => `+line ${index}`).join("\n");
@@ -189,6 +190,37 @@ test("process-stop approval identifies the exact managed process tree", () => {
 	assert.match(output, /process-123/);
 	assert.match(output, /npm run dev/);
 	assert.match(output, /descendants will be terminated/i);
+});
+
+test("operation approval is sanitized, bounded, and rendered generically", () => {
+	const workspaceRoot = "C:\\workspace";
+	const subject = governLogosApprovalSubject({
+		kind: "operation",
+		title: "\u001b[31mDeploy service\u001b[0m",
+		action: "business.deployment.execute",
+		target: `${workspaceRoot}\\service-a`,
+		facts: Array.from({ length: 20 }, (_, index) => ({
+			label: `Fact ${index}`,
+			value: index === 0 ? "to\u200bken=private" : `value-${index}`,
+		})),
+		warning: "Production change",
+	}, workspaceRoot);
+	assert.equal(subject.kind, "operation");
+	if (subject.kind !== "operation") assert.fail("expected operation approval");
+	assert.equal(subject.facts.length, 12);
+	assert.equal(subject.facts[0]?.value, "token=<redacted>");
+	assert.match(subject.target, /<workspace>/);
+	assert.doesNotMatch(subject.title, /\u001b/);
+
+	const card = new LogosApprovalCard(subject);
+	const output = card.render(64).join("\n");
+	assert.match(output, /Deploy service/);
+	assert.match(output, /business\.deployment\.execute/);
+	assert.match(output, /token=<redacted>/);
+	assert.match(output, /Warning: Production change/);
+	for (const line of card.render(36)) {
+		assert.ok(visibleWidth(line) <= 36, `${visibleWidth(line)} exceeds 36`);
+	}
 });
 
 test("command approval makes the complete literal argument list reachable", () => {

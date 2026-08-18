@@ -19,12 +19,13 @@ Each `ManagedToolDescriptor` declares only behavior that the shared system canno
 - `capabilities` and `defaultPermission` for authorization;
 - optional `authorization` for a prepared operation or approval subject;
 - optional `audit.summarizeInput` for sensitive or high-volume input;
-- optional `context.maxBytes` and `context.project` for model-facing result governance;
+- optional `context.maxBytes` and `context.project` for canonical result governance before the result reaches TUI, Session, and model context;
 - `context.history` when a result is either safe to compact or must be preserved.
 
-`context.history` has two values:
+`context.history` has three values:
 
 - `compact`: old results may be replaced in provider context after the recent working set and byte budget are satisfied;
+- `compact-after-use`: the result is preserved for its first Provider projection, then replaced by a stable summary on later Provider requests;
 - `preserve`: the result is excluded from automatic history projection because it carries state such as an edit proposal.
 
 The descriptor registry is the only source for that decision. `model-context.ts` must not maintain a second list of tool names.

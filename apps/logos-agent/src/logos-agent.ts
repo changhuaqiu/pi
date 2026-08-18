@@ -91,6 +91,7 @@ import {
 import {
 	createGenericLogosApprovalSubject,
 	createLogosToolDescriptors,
+	governLogosApprovalSubject,
 	type LogosApprovalSubject,
 	type LogosTool,
 } from "./logos-tools.ts";
@@ -565,6 +566,8 @@ export class HarnessLogosAgent implements LogosAgent {
 			permissionStore: this.toolPermissions,
 			requestApproval: async (subject) => await this.requestApproval(subject),
 			createGenericApprovalSubject: createGenericLogosApprovalSubject,
+			governApprovalSubject: (subject) =>
+				governLogosApprovalSubject(subject, this.config.workspaceRoot),
 			recordAudit: async (record) => {
 				const entryId = await session.appendCustomEntry("tool_audit", record);
 				await this.recordTaskRunEvidence(taskRuns, {
@@ -584,6 +587,12 @@ export class HarnessLogosAgent implements LogosAgent {
 					metadata: {
 						entryId,
 						toolName: record.toolName,
+						...(record.phase === "decision" && record.approval !== undefined
+							? { approval: record.approval }
+							: {}),
+						...(record.phase === "decision" && record.reason !== undefined
+							? { reason: record.reason }
+							: {}),
 					},
 				});
 				await this.emit({ type: "audit", record });

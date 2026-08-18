@@ -6,6 +6,8 @@ export interface ToolDecisionAuditRecord {
 	toolCallId: string;
 	toolName: string;
 	decision: "allowed" | "blocked";
+	approval?: "approved" | "rejected" | "failed";
+	reason?: string;
 	input: Record<string, unknown>;
 	timestamp: string;
 }
@@ -66,12 +68,18 @@ export function createDecisionAuditRecord(
 	toolName: string,
 	inputSummary: Record<string, unknown>,
 	decision: ToolDecisionAuditRecord["decision"],
+	options: {
+		approval?: ToolDecisionAuditRecord["approval"];
+		reason?: string;
+	} = {},
 ): ToolDecisionAuditRecord {
 	return {
 		phase: "decision",
 		toolCallId,
 		toolName,
 		decision,
+		...(options.approval === undefined ? {} : { approval: options.approval }),
+		...(options.reason === undefined ? {} : { reason: options.reason }),
 		input: structuredClone(inputSummary),
 		timestamp: new Date().toISOString(),
 	};

@@ -16,13 +16,7 @@ export type LogosProgressEvent =
 	| { type: "tool_finished"; toolName: string; isError: boolean }
 	| {
 			type: "approval_requested";
-			subjectKind:
-				| "edit"
-				| "directories"
-				| "task"
-				| "command"
-				| "process_stop"
-				| "tool";
+			subjectKind: string;
 	  }
 	| { type: "approval_resolved"; approved: boolean }
 	| { type: "turn_finished" }

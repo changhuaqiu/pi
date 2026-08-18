@@ -10,6 +10,7 @@ import {
 import {
 	InMemoryToolPermissionStore,
 	ToolSystem,
+	defineBusinessToolCapability,
 	type ManagedToolDescriptor,
 	type ToolAuthorizationContext,
 	type ToolCapability,
@@ -105,6 +106,7 @@ function createSystem(options: {
 	permissionStore?: InMemoryToolPermissionStore;
 	audits?: ToolAuditRecord[];
 	approvalSubjects?: TestApprovalSubject[];
+	governApprovalSubject?: (subject: TestApprovalSubject) => TestApprovalSubject;
 	guardToolCall?: (
 		context: ToolAuthorizationContext,
 	) => { block?: boolean; reason?: string } | undefined;
@@ -124,6 +126,7 @@ function createSystem(options: {
 				capabilities: context.capabilities,
 			};
 		},
+		governApprovalSubject: options.governApprovalSubject,
 		async recordAudit(record) {
 			audits.push(record);
 		},
@@ -157,6 +160,55 @@ test("ToolSystem registers tools and generates the model-facing policy block", (
 		/<tool-policy>[\s\S]*read_file: permission=allow; capabilities=fs\.read\(workspace\)/,
 	);
 	assert.match(system.buildSystemPrompt("Base prompt"), /Read bounded workspace files/);
+});
+
+test("ToolSystem accepts validated business capability namespaces", () => {
+	const permissionStore = new InMemoryToolPermissionStore();
+	const system = createSystem({ permissionStore });
+	const capability = defineBusinessToolCapability("business.deployment.read");
+	system.register(createDescriptor("inspect_deployment", {
+		capabilities: [{ kind: capability, scope: "configured-environments" }],
+	}));
+
+	assert.match(
+		system.buildSystemPrompt("Base"),
+		/business\.deployment\.read\(configured-environments\)/,
+	);
+	system.setCapabilityPermission(capability, "deny");
+	assert.deepEqual(system.getTools(), []);
+	assert.equal(
+		system.getPermissionSnapshot().capabilities[capability],
+		"deny",
+	);
+});
+
+test("business capabilities require validated lowercase domain and action names", () => {
+	assert.throws(
+		() => defineBusinessToolCapability("business.Deployment"),
+		/business\.<domain>\.<action>/,
+	);
+	const system = createSystem();
+	assert.throws(
+		() => system.register(createDescriptor("unsafe_business_tool", {
+			capabilities: [{
+				kind: "business.deployment" as ToolCapability["kind"],
+				scope: "environment",
+			}],
+		})),
+		/Invalid tool capability kind/,
+	);
+	assert.throws(
+		() => system.register(createDescriptor("object_capability_tool", {
+			capabilities: [{
+				kind: {
+					length: "business.deployment.execute".length,
+					toString: () => "business.deployment.execute",
+				} as unknown as ToolCapability["kind"],
+				scope: "environment",
+			}],
+		})),
+		/Invalid tool capability kind/,
+	);
 });
 
 test("ToolSystem exposes descriptor-owned context history policy", () => {
@@ -856,6 +908,62 @@ test("ToolSystem freezes inputs, requests approval, grants authorization, and au
 		audits[0]?.phase === "decision" ? audits[0].input : undefined,
 		{ proposalId: "proposal-1" },
 	);
+	assert.equal(
+		audits[0]?.phase === "decision" ? audits[0].approval : undefined,
+		"approved",
+	);
+});
+
+test("ToolSystem governs approval subjects before publishing them", async () => {
+	const approvalSubjects: TestApprovalSubject[] = [];
+	const system = createSystem({
+		approvalSubjects,
+		governApprovalSubject(subject) {
+			return { ...subject, toolName: `${subject.toolName}-governed` };
+		},
+	});
+	system.register(createDescriptor("apply_edit", {
+		defaultPermission: "ask",
+	}));
+
+	assert.equal(await system.onToolCall({
+		type: "tool_call",
+		toolCallId: "call-governed-approval",
+		toolName: "apply_edit",
+		input: {},
+	}), undefined);
+	assert.equal(approvalSubjects[0]?.toolName, "apply_edit-governed");
+});
+
+test("ToolSystem audits approval preparation failures", async () => {
+	const audits: ToolAuditRecord[] = [];
+	const system = createSystem({
+		audits,
+		governApprovalSubject() {
+			throw new Error("unsafe approval subject");
+		},
+	});
+	system.register(createDescriptor("apply_edit", {
+		defaultPermission: "ask",
+	}));
+
+	assert.deepEqual(await system.onToolCall({
+		type: "tool_call",
+		toolCallId: "call-failed-approval",
+		toolName: "apply_edit",
+		input: {},
+	}), {
+		block: true,
+		reason: "Tool approval failed: apply_edit",
+	});
+	assert.equal(
+		audits[0]?.phase === "decision" ? audits[0].approval : undefined,
+		"failed",
+	);
+	assert.equal(
+		audits[0]?.phase === "decision" ? audits[0].reason : undefined,
+		"Tool approval failed: apply_edit",
+	);
 });
 
 test("allow permission grants authorization without opening approval", async () => {
@@ -965,6 +1073,11 @@ test("ToolSystem rejects approval without granting authorization", async () => {
 	});
 	assert.equal(granted, false);
 	assert.equal(audits[0]?.phase === "decision" ? audits[0].decision : undefined, "blocked");
+	assert.equal(audits[0]?.phase === "decision" ? audits[0].approval : undefined, "rejected");
+	assert.equal(
+		audits[0]?.phase === "decision" ? audits[0].reason : undefined,
+		"User rejected the requested operation",
+	);
 });
 
 test("ToolSystem rechecks permissions after authorization and approval", async () => {
@@ -1061,7 +1174,7 @@ test("ToolSystem blocks permission revocation while an asynchronous grant is pen
 	assert.equal(audits[0]?.phase === "decision" ? audits[0].decision : undefined, "blocked");
 });
 
-test("ToolSystem projects, redacts, bounds, and audits model-facing results", async () => {
+test("ToolSystem projects, redacts, bounds, and audits canonical results", async () => {
 	const audits: ToolAuditRecord[] = [];
 	const system = createSystem({ audits });
 	system.register(

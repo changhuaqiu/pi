@@ -14,7 +14,7 @@
 - 业务深模块负责业务规则、状态机、幂等和并发校验；
 - 外部 Adapter 负责连接部署平台、工单平台或内部系统。
 
-`ManagedToolDescriptor` 是业务能力进入工具系统的唯一 seam。新增业务工具时，Harness 和 ToolSystem 的执行管道不应出现业务名称判断。
+`ManagedToolDescriptor` 是业务能力进入工具系统的唯一 seam。Agent Loop 继续校验参数并调用 `tool.execute()`；ToolSystem 只负责注册以及调用前后的治理。新增业务工具时，Harness、Agent Loop 和 ToolSystem 的治理管道都不应出现业务名称判断。
 
 ```mermaid
 flowchart LR
@@ -123,7 +123,7 @@ ToolSystem 不应理解：
 ```typescript
 function createDeploymentToolDescriptors(
   domain: DeploymentDomain,
-): readonly ManagedToolDescriptor<LogosTool, LogosApprovalSubject>[];
+): readonly ManagedToolDescriptor<AgentTool, LogosApprovalSubject>[];
 ```
 
 只有两个以上业务模块出现稳定、重复的装配逻辑后，才考虑提取更小的组合接口。
@@ -157,7 +157,7 @@ flowchart TD
 2. 外部 Adapter 依赖业务 Port，不依赖模型工具 Schema；
 3. 业务工具 Adapter 同时依赖业务模块和 `ManagedToolDescriptor`，负责协议转换；
 4. Composition Root 负责创建 Adapter、业务模块和描述符，并注册到 ToolSystem；
-5. ToolSystem 只保存和执行描述符，不反向依赖任何业务包。
+5. ToolSystem 只保存描述符并执行调用前后治理，不反向依赖任何业务包；实际 `tool.execute()` 仍由 Agent Loop 调用。
 
 业务工具 Adapter 是必要的浅 Adapter：它位于模型工具协议与业务模块接口之间。业务规则不能留在这一层。
 
@@ -208,7 +208,7 @@ apps/logos-agent/test/business/
 ```typescript
 function createDeploymentToolDescriptors(
   domain: DeploymentDomain,
-): readonly ManagedToolDescriptor<LogosTool, LogosApprovalSubject>[] {
+): readonly ManagedToolDescriptor<AgentTool, LogosApprovalSubject>[] {
   return [
     createInspectDeploymentDescriptor(domain),
     createPrepareDeploymentDescriptor(domain),
@@ -260,7 +260,7 @@ business.task.complete
 - 权限仍遵循“最严格结果生效”：`deny > ask > allow`；
 - capability 名称进入审计和 System Prompt，但不得包含租户、密钥或用户输入。
 
-是否使用模板字面量类型或泛型属于实现细节。设计要求是：新增业务 capability 不修改 ToolSystem 执行逻辑。
+业务 capability 通过 `defineBusinessToolCapability()` 校验并获得 branded string 类型，避免退化成任意字符串。新增业务 capability 不修改 ToolSystem 治理逻辑。
 
 ### 6.3 通用业务审批主题
 
@@ -514,11 +514,13 @@ deployment_status(operationId)
 
 `onUpdate` 只用于一次有界调用内部的阶段进度，例如“正在验证计划”或“正在提交部署”。它不是远端任务的持久订阅机制。
 
+当前 `onUpdate` 由 Agent Loop 直接发送，不经过 ToolSystem 的 `onToolResult()`。因此业务工具的 partial update 只能包含固定阶段码和有界安全文本，禁止包含平台原始日志、凭据或业务敏感正文。
+
 模型不应高频轮询。业务结果可以给出 `nextPollAfterMs`，工具 guidance 要求尊重平台建议；是否需要未来的运行时调度器，应由真实 Trace 中的轮询浪费证明，不能在第一阶段预建。
 
 ## 12. 工具结果与 Context
 
-### 12.1 三种结果用途
+### 12.1 当前只有一份治理后的最终结果
 
 业务工具返回的数据有三种消费者：
 
@@ -528,7 +530,9 @@ deployment_status(operationId)
 | TUI | 用户可理解的进度、计划、结果和错误 |
 | 审计/观测 | 工具、目标摘要、决策、耗时、结果大小和状态 |
 
-不能用一份完整平台日志同时满足三者。
+当前 `ToolSystem.onToolResult()` 返回的 patch 会成为规范 ToolResult：同一份治理后结果发送给 TUI、写入 Session，并在 ContextManager 投影后进入模型。现在没有独立的“TUI 完整结果”和“模型摘要结果”通道。
+
+第一阶段必须返回一份三者都可安全使用的有界结果。完整平台日志保留在业务平台，只返回稳定的 `logReference`。如果 Trace 证明 TUI 与模型确实需要不同内容，模型专用投影 seam 应放在 ContextManager 或 `convertToLlm()` 之前，而不是继续扩展 `afterToolCall`。
 
 ### 12.2 模型可见结果
 
@@ -569,7 +573,7 @@ interface DeploymentOperation {
 
 - 完整日志保留在外部平台，模型只得到 `logReference` 和关键片段；
 - `details` 也必须有界，不能借 TUI 名义把完整日志写入 Session；
-- `project` 将平台响应转换为模型需要的稳定事实；
+- `project` 将平台响应转换为 TUI、Session 和模型都能安全使用的稳定事实；
 - 非成功终态通过现有 `isError` 明确表达，TUI 不解析文本猜测；
 - `prepare_deployment` 的计划结果初期使用 `preserve`，确保 `planId` 和风险在执行前可见；
 - 执行和状态结果使用 `compact`；
@@ -673,7 +677,7 @@ interface DeploymentPlatform {
 第一阶段使用启动配置静态启用业务工具包：
 
 ```text
-LOGOS_AGENT_CAPABILITIES=deployment,tasks
+LOGOS_AGENT_TOOL_PACKS=deployment,tasks
 ```
 
 规则：
@@ -850,13 +854,15 @@ const businessDescriptors = [
 
 ### ToolSystem
 
-保留现有执行管道。实现阶段只允许为通用扩展点做最小调整：
+保留现有注册与调用前后治理管道。实现阶段只允许为通用扩展点做最小调整：
 
 - 支持业务 capability 命名空间；
 - 支持通用 operation 审批主题；
 - 记录业务 Schema 预算所需的通用统计，如果现有观测无法取得。
 
 不能增加部署、工单或用户任务专用判断。
+
+ToolSystem 不接管 `tool.execute()`，也不重复 Agent Loop 已完成的 TypeBox 参数校验。
 
 ### ContextManager
 
@@ -946,7 +952,7 @@ const businessDescriptors = [
 首个业务工具模块完成时应满足：
 
 1. Harness 和 Agent Loop 不包含业务名称或业务判断；
-2. ToolSystem 执行管道不包含部署工具名分支；
+2. ToolSystem 调用前后治理管道不包含部署工具名分支；
 3. 业务深模块不依赖 Agent、Harness、TUI 或 Provider 类型；
 4. 真实 Adapter 和内存 Adapter 满足同一个业务 Port；
 5. 所有副作用都经过 ToolSystem 权限和审批；
