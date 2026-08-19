@@ -1,6 +1,6 @@
 # Logos Agent 业务工具模块设计
 
-> 状态：设计稿，尚未实现。
+> 状态：业务工具基础 seam 已实现，真实业务 Adapter 尚未实现。
 >
 > 本文定义部署、工单、用户任务等业务能力如何接入 Logos Agent。它不改变 Agent Loop，不把业务逻辑加入 Harness，也不引入新的工具基类或插件运行时。
 
@@ -16,31 +16,87 @@
 
 `ManagedToolDescriptor` 是业务能力进入工具系统的唯一 seam。Agent Loop 继续校验参数并调用 `tool.execute()`；ToolSystem 只负责注册以及调用前后的治理。新增业务工具时，Harness、Agent Loop 和 ToolSystem 的治理管道都不应出现业务名称判断。
 
-```mermaid
-flowchart LR
-    USER["用户目标"] --> MODEL["LLM<br/>理解与编排"]
-    MODEL --> HARNESS["AgentHarness<br/>Turn / Session / Abort / Events"]
-    HARNESS --> SYSTEM["ToolSystem<br/>Policy / Audit / Context"]
+### 1.1 完整架构
 
-    subgraph BUSINESS["业务工具模块"]
-        TOOL["业务工具 Adapter<br/>Schema + Descriptor"]
-        DOMAIN["业务深模块<br/>规则 + 状态机"]
-        PORT["外部系统 Port"]
+实线表示一次 Turn 中的调用或数据流；虚线表示启动装配或接口实现关系。图中标注“待实现”的业务模块是下一阶段范围，不属于 Harness 或 ToolSystem。
+
+```mermaid
+flowchart TB
+    USER["用户"]
+    TUI["TUI<br/>输入 / 审批 / 工具结果"]
+    PROVIDER["LLM Provider<br/>推理与工具选择"]
+    OBS["Observability<br/>Harness events + Tool audit"]
+
+    subgraph RUNTIME["Agent 运行时（已存在）"]
+        HARNESS["AgentHarness<br/>Turn / Session / Abort / Events"]
+        LOOP["Agent Loop<br/>Schema 校验 / 唯一 execute 调度"]
+        CONTEXT["ContextManager<br/>工作集 / 压缩策略"]
+        CONVERT["convertToLlm()<br/>Provider Message 投影"]
+        SESSION["Session Tree<br/>Agent Message / canonical ToolResult"]
     end
 
-    SYSTEM --> TOOL
-    TOOL --> DOMAIN
-    DOMAIN --> PORT
-    PORT --> EXTERNAL["部署平台 / 工单平台 / 内部系统"]
+    subgraph GOVERNANCE["工具治理（基础 seam 已实现）"]
+        SYSTEM["ToolSystem<br/>注册 / 权限 / 审批 / 审计 / 结果治理"]
+        REGISTRY["ManagedToolDescriptor Registry<br/>capability / guidance / context policy"]
+        APPROVAL["ApprovalCoordinator<br/>approved / rejected / failed"]
+    end
 
-    EXTERNAL --> PORT
-    PORT --> DOMAIN
-    DOMAIN --> TOOL
-    TOOL --> SYSTEM
-    SYSTEM --> HARNESS
-    HARNESS --> MODEL
-    MODEL --> USER
+    subgraph BUSINESS["业务工具模块（真实 Adapter 待实现）"]
+        TOOL["业务 Tool Adapter<br/>TypeBox Schema / AgentTool"]
+        DOMAIN["业务深模块<br/>规则 / 计划 / 幂等 / 状态机"]
+        PORT["业务 Port"]
+        PROD["真实外部 Adapter"]
+        MEMORY["内存 Adapter<br/>测试"]
+    end
+
+    EXTERNAL["部署平台 / 工单平台 / 内部系统"]
+
+    USER --> TUI
+    TUI -->|"用户输入"| HARNESS
+    HARNESS -->|"开始 / 恢复 Turn"| LOOP
+    LOOP -->|"transformContext"| CONTEXT
+    CONTEXT --> CONVERT
+    CONVERT -->|"最终 messages + tools + system"| PROVIDER
+    PROVIDER -->|"assistant / tool call"| LOOP
+
+    SYSTEM -.->|"enabled tools + system guidance"| HARNESS
+    REGISTRY --> SYSTEM
+    LOOP -->|"beforeToolCall"| SYSTEM
+    SYSTEM -->|"ask"| APPROVAL
+    APPROVAL -->|"approval_request"| HARNESS
+    HARNESS -->|"审批事件"| TUI
+    TUI -->|"批准 / 拒绝"| HARNESS
+    HARNESS -->|"respond"| APPROVAL
+    APPROVAL -->|"审批结果"| SYSTEM
+    SYSTEM -->|"allow / block"| LOOP
+
+    LOOP -->|"唯一调用 tool.execute()"| TOOL
+    TOOL -->|"协议转换"| DOMAIN
+    DOMAIN -->|"调用"| PORT
+    PORT -.->|"生产绑定"| PROD
+    PORT -.->|"测试绑定"| MEMORY
+    PROD <--> EXTERNAL
+
+    DOMAIN -->|"领域结果"| TOOL
+    TOOL -->|"原始 ToolResult"| LOOP
+    LOOP -->|"afterToolCall"| SYSTEM
+    SYSTEM -->|"canonical ToolResult"| LOOP
+    LOOP -->|"Agent Message + events"| HARNESS
+    HARNESS -->|"保存"| SESSION
+    HARNESS -->|"UI events"| TUI
+    SESSION -->|"下一次 Provider 请求"| CONTEXT
+
+    SYSTEM -->|"安全审计"| OBS
+    HARNESS -->|"events / spans"| OBS
 ```
+
+这张图强调三个不会混合的职责：
+
+1. **Agent Loop 执行**：校验工具参数，并且是唯一调用 `tool.execute()` 的模块；
+2. **ToolSystem 治理**：在调用前决定权限和审批，在调用后生成有界、脱敏的 canonical ToolResult；
+3. **业务模块处理业务**：Tool Adapter 只转换协议，业务规则集中在业务深模块，外部平台通过 Port 和 Adapter 接入。
+
+工具结果不会从 ToolSystem 直接“发给模型”。它先回到 Agent Loop，随后作为 Agent Message 进入 TUI 和 Session；下一次 Provider 请求再由 ContextManager 与 `convertToLlm()` 选择和投影。
 
 ## 2. 要解决的问题
 
@@ -386,53 +442,75 @@ interface DeploymentPlan {
 ```mermaid
 sequenceDiagram
     participant U as 用户
-    participant M as LLM
-    participant H as Harness
+    participant UI as TUI / Harness
+    participant M as LLM Provider
+    participant L as Agent Loop
     participant T as ToolSystem
     participant BT as 部署工具 Adapter
     participant D as DeploymentDomain
     participant P as 部署平台
 
-    U->>M: 将 service-a 部署到测试环境
-    M->>H: inspect_deployment
-    H->>T: beforeToolCall
-    T-->>H: allow + audit
-    H->>BT: execute
+    U->>UI: 将 service-a 部署到测试环境
+    UI->>L: 开始 Turn
+    L->>M: Provider Payload
+    M->>L: inspect_deployment
+    L->>T: beforeToolCall
+    T-->>L: allow + audit
+    L->>BT: execute
     BT->>D: inspect
     D->>P: 查询当前状态
     P-->>D: 当前版本和健康状态
     D-->>BT: DeploymentSnapshot
-    BT-->>H: 有界 ToolResult
-    H->>T: afterToolCall
-    T-->>M: 脱敏后的当前状态
+    BT-->>L: 原始 ToolResult
+    L->>T: afterToolCall
+    T-->>L: canonical ToolResult
+    L-->>M: 脱敏后的当前状态
 
-    M->>H: prepare_deployment
-    H->>T: beforeToolCall
-    T-->>H: allow
-    H->>BT: execute
+    M->>L: prepare_deployment
+    L->>T: beforeToolCall
+    T-->>L: allow
+    L->>BT: execute
     BT->>D: prepare
     D->>P: 验证目标和版本
     P-->>D: 真实状态
-    D-->>M: planId + 影响 + 风险 + TTL
+    D-->>BT: planId + 影响 + 风险 + TTL
+    BT-->>L: 原始计划结果
+    L->>T: afterToolCall
+    T-->>L: canonical 计划结果
+    L-->>M: planId + 影响 + 风险 + TTL
 
-    M->>H: apply_deployment(planId)
-    H->>T: beforeToolCall
-    T->>U: operation 审批卡
-    U-->>T: approve / reject
-    T-->>H: allow / block
-    H->>BT: execute
+    M->>L: apply_deployment(planId)
+    L->>T: beforeToolCall
+    T->>UI: approval_request
+    UI->>U: operation 审批卡
+    U-->>UI: approve / reject
+    UI-->>T: approved / rejected / failed
+    T-->>L: allow / block
+    L->>BT: execute
     BT->>D: apply(planId)
     D->>P: 复检状态并启动部署
     P-->>D: operationId + running
-    D-->>M: operationId + status
+    D-->>BT: operationId + running
+    BT-->>L: 原始执行结果
+    L->>T: afterToolCall
+    T-->>L: canonical 执行结果
+    L-->>M: operationId + status
 
-    M->>H: deployment_status(operationId)
-    H->>BT: execute
+    M->>L: deployment_status(operationId)
+    L->>T: beforeToolCall
+    T-->>L: allow
+    L->>BT: execute
     BT->>D: status
     D->>P: 查询真实终态
     P-->>D: succeeded + 健康证据
-    D-->>M: 有界终态
-    M-->>U: 自然语言说明结果和验证证据
+    D-->>BT: 领域终态
+    BT-->>L: 原始状态结果
+    L->>T: afterToolCall
+    T-->>L: canonical 状态结果
+    L-->>M: 有界终态
+    M-->>L: 自然语言总结
+    L-->>UI: assistant message
+    UI-->>U: 结果和验证证据
 ```
 
 ## 9. 权限与审批
