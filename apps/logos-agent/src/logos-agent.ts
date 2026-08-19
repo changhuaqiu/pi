@@ -162,6 +162,7 @@ export type LogosAgentEvent =
 		  }
 	| { type: "task_run_update"; run: TaskRunState };
 export type { LogosApprovalSubject } from "./logos-tools.ts";
+export type LogosApprovalOutcome = "approved" | "rejected" | "failed";
 export type LogosAgentUiEvent =
 	| LogosAgentEvent
 	| { type: "approval_request"; request: ApprovalRequest<LogosApprovalSubject> }
@@ -169,7 +170,7 @@ export type LogosAgentUiEvent =
 			type: "approval_resolved";
 			requestId: string;
 			subjectKind: LogosApprovalSubject["kind"];
-			approved: boolean;
+			outcome: LogosApprovalOutcome;
 	  }
 	| { type: "question_request"; request: UserQuestionRequest }
 	| {
@@ -1091,6 +1092,8 @@ export class HarnessLogosAgent implements LogosAgent {
 		};
 		const requestHolder: { value?: ApprovalRequest<LogosApprovalSubject> } = {};
 		let approved = false;
+		let outcome: LogosApprovalOutcome = "failed";
+		let failure: unknown;
 		try {
 			approved = await this.approval.request(subject, async (request) => {
 				requestHolder.value = request;
@@ -1114,9 +1117,13 @@ export class HarnessLogosAgent implements LogosAgent {
 				}
 				await requestApproval(request);
 			});
-		} finally {
-			const request = requestHolder.value;
-			if (request && this.activeTaskRunId !== undefined) {
+			outcome = approved ? "approved" : "rejected";
+		} catch (error) {
+			failure = error;
+		}
+		const request = requestHolder.value;
+		if (request && this.activeTaskRunId !== undefined) {
+			try {
 				const run = await this.taskRuns.get(this.activeTaskRunId);
 				if (run.status === "waiting") {
 					await this.applyTaskRunUpdate(
@@ -1126,26 +1133,41 @@ export class HarnessLogosAgent implements LogosAgent {
 						{ idempotencyKey: `approval:resume:${request.id}` },
 					);
 				}
-				await this.recordTaskRunEvidence(
-					this.taskRuns,
-					{
-						kind: "approval",
-						sourceId: request.id,
-						outcome: approved ? "approved" : "rejected",
-						metadata: { subjectKind: request.subject.kind },
-					},
-					{ idempotencyKey: `approval:resolved:${request.id}` },
-				);
+			} catch (error) {
+				failure ??= error;
 			}
 		}
-		if (requestHolder.value) {
-			await this.emit({
+		if (request) {
+			if (failure !== undefined) outcome = "failed";
+			try {
+				await this.emit({
 				type: "approval_resolved",
-				requestId: requestHolder.value.id,
-				subjectKind: requestHolder.value.subject.kind,
-				approved,
-			});
+					requestId: request.id,
+					subjectKind: request.subject.kind,
+					outcome,
+				});
+			} catch (error) {
+				failure ??= error;
+				outcome = "failed";
+			}
+			if (this.activeTaskRunId !== undefined) {
+				try {
+					await this.recordTaskRunEvidence(
+						this.taskRuns,
+						{
+							kind: "approval",
+							sourceId: request.id,
+							outcome,
+							metadata: { subjectKind: request.subject.kind },
+						},
+						{ idempotencyKey: `approval:resolved:${request.id}` },
+					);
+				} catch (error) {
+					failure ??= error;
+				}
+			}
 		}
+		if (failure !== undefined) throw failure;
 		return approved;
 	}
 

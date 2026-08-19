@@ -235,7 +235,7 @@ for (const descriptor of descriptors) {
 
 ### 6.2 Capability 命名
 
-当前 `ToolCapabilityKind` 是封闭联合类型。业务工具持续增加后，如果每个 capability 都修改 ToolSystem 核心类型，业务知识会向工具系统泄漏。
+早期的 `ToolCapabilityKind` 是封闭联合类型；当前已保留核心 capability，并通过 `defineBusinessToolCapability()` 开放受校验的业务命名空间。真实业务 Adapter 尚未实现，后续增加 capability 不应再修改 ToolSystem 核心类型。
 
 实现阶段应保留现有核心 capability，并允许受校验的业务命名空间：
 

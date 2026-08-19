@@ -10,7 +10,7 @@ import {
 	createResultAuditRecord,
 	DEFAULT_MAX_TOOL_RESULT_BYTES,
 	freezeToolInput,
-	redactSensitiveText,
+	redactSensitiveSingleLineText,
 	redactToolResult,
 	sanitizeAuditInput,
 	type ToolAuditRecord,
@@ -411,10 +411,7 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 			capabilities: descriptor.capabilities,
 		};
 		const safeReason = (reason: string): string =>
-			redactSensitiveText(reason, this.workspaceRoot)
-				.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ")
-				.trim()
-				.slice(0, 500);
+			redactSensitiveSingleLineText(reason, this.workspaceRoot, 500);
 		const recordDecision = async (
 			decision: "allowed" | "blocked",
 			options: {
@@ -432,9 +429,7 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 						...(options.approval === undefined
 							? {}
 							: { approval: options.approval }),
-						...(options.reason === undefined
-							? {}
-							: { reason: safeReason(options.reason) }),
+						...(options.reason === undefined ? {} : { reason: options.reason }),
 					},
 				),
 			);
@@ -449,10 +444,13 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 		try {
 			const guardResult = await this.guardToolCall?.(authorizationContext);
 			if (guardResult?.block) {
+				const reason = safeReason(
+					guardResult.reason ?? `Tool guard blocked: ${event.toolName}`,
+				) || `Tool guard blocked: ${event.toolName}`;
 				await recordDecision("blocked", {
-					reason: guardResult.reason ?? `Tool guard blocked: ${event.toolName}`,
+					reason,
 				});
-				return guardResult;
+				return { ...guardResult, reason };
 			}
 		} catch {
 			await recordDecision("blocked", { reason: `Tool guard failed: ${event.toolName}` });
@@ -470,8 +468,9 @@ export class ToolSystem<TTool extends AgentTool, TApprovalSubject> {
 			return { block: true, reason: `Tool authorization failed: ${event.toolName}` };
 		}
 		if (preparation.kind === "deny") {
-			await recordDecision("blocked", { reason: preparation.reason });
-			return { block: true, reason: preparation.reason };
+			const reason = safeReason(preparation.reason) || `Tool authorization denied: ${event.toolName}`;
+			await recordDecision("blocked", { reason });
+			return { block: true, reason };
 		}
 
 		let approvalGranted = false;

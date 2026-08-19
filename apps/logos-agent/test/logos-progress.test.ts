@@ -21,7 +21,7 @@ test("logos progress exposes the observe-propose-apply-verify loop", () => {
 	assert.equal(review.elapsedMs, 500);
 	assert.equal(review.phaseElapsedMs, 100);
 
-	progress.apply({ type: "approval_resolved", approved: true }, 2_600);
+	progress.apply({ type: "approval_resolved", outcome: "approved" }, 2_600);
 	progress.apply({ type: "tool_started", toolName: "apply_edit" }, 2_700);
 	progress.apply({ type: "tool_finished", toolName: "apply_edit", isError: false }, 2_800);
 	progress.apply({ type: "tool_started", toolName: "run_task" }, 2_900);
@@ -48,6 +48,20 @@ test("logos progress preserves failures in the visible trace", () => {
 	assert.equal(snapshot.phase, "idle");
 	assert.equal(snapshot.failures, 2);
 	assert.match(formatLogosTrace(snapshot), /fail 2/);
+});
+
+test("failed approval resolution remains visible as a failure", () => {
+	const progress = new LogosProgress(0);
+	progress.apply({ type: "turn_started" }, 10);
+	progress.apply({ type: "approval_requested", subjectKind: "operation" }, 20);
+	const snapshot = progress.apply(
+		{ type: "approval_resolved", outcome: "failed" },
+		30,
+	);
+
+	assert.equal(snapshot.phase, "reasoning");
+	assert.equal(snapshot.detail, "approval failed");
+	assert.equal(snapshot.failures, 1);
 });
 
 test("repeated activity updates preserve the phase clock", () => {

@@ -1786,11 +1786,13 @@ export class LogosAgentTui {
 			this.approvalCard = undefined;
 			overlay?.hide();
 			this.addSystemLine(
-				event.approved
+				event.outcome === "approved"
 					? chalk.green(`${event.subjectKind} approved once`)
-					: chalk.red(`${event.subjectKind} rejected`),
+					: event.outcome === "rejected"
+						? chalk.red(`${event.subjectKind} rejected`)
+						: chalk.red(`${event.subjectKind} approval failed`),
 			);
-			this.applyProgress({ type: "approval_resolved", approved: event.approved });
+			this.applyProgress({ type: "approval_resolved", outcome: event.outcome });
 			this.tui.requestRender();
 			return;
 		}

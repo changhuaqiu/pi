@@ -1076,7 +1076,7 @@ test("activity animation advances, throttles review, and stops after abort", asy
 		type: "approval_resolved",
 		requestId: "approval-1",
 		subjectKind: "directories",
-		approved: false,
+		outcome: "rejected",
 	});
 	terminal.sendInput("\x1b");
 	await waitFor(() => !agent.isBusy());
@@ -1093,6 +1093,52 @@ test("activity animation advances, throttles review, and stops after abort", asy
 	await terminal.flush();
 	assert.equal(terminal.writeCount, writesAfterAbort);
 
+	terminal.sendInput("\x04");
+	await running;
+});
+
+test("narrow operation approval keeps long target, warning, and controls reachable", async () => {
+	const agent = new FakeLogosAgent();
+	const terminal = new VirtualTerminal(48, 24);
+	const app = new LogosAgentTui(agent, terminal);
+	const running = app.run();
+	await terminal.waitForRender();
+
+	const targetTail = "TARGET_OVERLAY_TAIL";
+	const warningTail = "WARNING_OVERLAY_TAIL";
+	await agent.emitEvent({
+		type: "approval_request",
+		request: {
+			id: "operation-approval-1",
+			subject: {
+				kind: "operation",
+				title: "Deploy service",
+				action: "business.deployment.execute",
+				target: `service-${"target-segment-".repeat(24)}${targetTail}`,
+				facts: [],
+				warning: `production-${"risk-segment-".repeat(20)}${warningTail}`,
+			},
+		},
+	});
+	await terminal.waitForRender();
+	const firstPage = terminal.getViewport().join("\n");
+	assert.match(firstPage, /\[y\] approve once/);
+	assert.doesNotMatch(firstPage, new RegExp(warningTail));
+
+	terminal.sendInput("\x1bOF");
+	await terminal.waitForRender();
+	const lastPage = terminal.getViewport().join("\n");
+	const compactLastPage = lastPage.replace(/\s+/g, "");
+	assert.match(compactLastPage, new RegExp(targetTail));
+	assert.match(compactLastPage, new RegExp(warningTail));
+	assert.match(lastPage, /\[y\] approve once/);
+
+	await agent.emitEvent({
+		type: "approval_resolved",
+		requestId: "operation-approval-1",
+		subjectKind: "operation",
+		outcome: "rejected",
+	});
 	terminal.sendInput("\x04");
 	await running;
 });

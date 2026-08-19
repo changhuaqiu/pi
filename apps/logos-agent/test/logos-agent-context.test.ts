@@ -7,13 +7,24 @@ import {
 	type UserQuestion,
 	UserQuestionCoordinator,
 } from "../src/ask-user-tool.ts";
+import { ApprovalCoordinator } from "../src/edit-approval.ts";
 import {
 	describeDirectoryMutationEvidence,
 	getMessageThinking,
 	HarnessLogosAgent,
+	type LogosAgentUiEvent,
+	type LogosApprovalSubject,
 	resolveLogosThinkingLevel,
 	shouldRunManualCompaction,
 } from "../src/logos-agent.ts";
+
+function bindRequestApproval(agent: HarnessLogosAgent) {
+	return (
+		agent as unknown as {
+			requestApproval(subject: LogosApprovalSubject): Promise<boolean>;
+		}
+	).requestApproval.bind(agent);
+}
 
 test("manual compaction threshold uses the unrounded context ratio", () => {
 	assert.equal(
@@ -161,6 +172,143 @@ test("abort and waitForIdle include pre-provider TaskRun finalization", async ()
 	finishSecondLifecycle();
 	await waiting;
 	assert.equal(idleReturned, true);
+});
+
+test("approval publication failure records failed and resumes a waiting TaskRun", async () => {
+	const approval = new ApprovalCoordinator<LogosApprovalSubject>();
+	const events: LogosAgentUiEvent[] = [];
+	const evidence: string[] = [];
+	const updates: string[] = [];
+	let runStatus = "active";
+	const agent = Object.create(HarnessLogosAgent.prototype) as HarnessLogosAgent;
+	Object.assign(agent as unknown as Record<string, unknown>, {
+		activeTaskRunId: "run-1",
+		approval,
+		taskRuns: {
+			async get() {
+				return { status: runStatus };
+			},
+		},
+		async applyTaskRunUpdate(
+			_controller: unknown,
+			_runId: string,
+			update: { type: string },
+		) {
+			updates.push(update.type);
+			runStatus = update.type === "wait" ? "waiting" : "active";
+		},
+		async recordTaskRunEvidence(
+			_controller: unknown,
+			entry: { outcome: string },
+		) {
+			evidence.push(entry.outcome);
+		},
+		async emit(event: LogosAgentUiEvent) {
+			events.push(event);
+			if (event.type === "approval_request") throw new Error("approval publication failed");
+		},
+	});
+
+	await assert.rejects(
+		bindRequestApproval(agent)({
+			kind: "tool",
+			toolName: "apply_edit",
+			capabilities: [],
+		}),
+		/approval publication failed/,
+	);
+	assert.deepEqual(updates, ["wait", "resume"]);
+	assert.deepEqual(evidence, ["started", "failed"]);
+	assert.equal(events.at(-1)?.type, "approval_resolved");
+	const resolved = events.at(-1);
+	assert.equal(
+		resolved?.type === "approval_resolved" ? resolved.outcome : undefined,
+		"failed",
+	);
+});
+
+test("approval wait failure is resolved and audited as failed", async () => {
+	const approval = new ApprovalCoordinator<LogosApprovalSubject>();
+	const events: LogosAgentUiEvent[] = [];
+	const evidence: string[] = [];
+	const agent = Object.create(HarnessLogosAgent.prototype) as HarnessLogosAgent;
+	Object.assign(agent as unknown as Record<string, unknown>, {
+		activeTaskRunId: "run-1",
+		approval,
+		taskRuns: {
+			async get() {
+				return { status: "active" };
+			},
+		},
+		async applyTaskRunUpdate() {
+			throw new Error("approval wait failed");
+		},
+		async recordTaskRunEvidence(
+			_controller: unknown,
+			entry: { outcome: string },
+		) {
+			evidence.push(entry.outcome);
+		},
+		async emit(event: LogosAgentUiEvent) {
+			events.push(event);
+		},
+	});
+
+	await assert.rejects(
+		bindRequestApproval(agent)({
+			kind: "tool",
+			toolName: "apply_edit",
+			capabilities: [],
+		}),
+		/approval wait failed/,
+	);
+	assert.deepEqual(evidence, ["started", "failed"]);
+	assert.deepEqual(events.map((event) => event.type), ["approval_resolved"]);
+	assert.equal(
+		events[0]?.type === "approval_resolved" ? events[0].outcome : undefined,
+		"failed",
+	);
+});
+
+test("approval resolution publication failure records failed instead of approved", async () => {
+	const approval = new ApprovalCoordinator<LogosApprovalSubject>();
+	const evidence: string[] = [];
+	const agent = Object.create(HarnessLogosAgent.prototype) as HarnessLogosAgent;
+	Object.assign(agent as unknown as Record<string, unknown>, {
+		activeTaskRunId: "run-1",
+		approval,
+		taskRuns: {
+			async get() {
+				return { status: "waiting" };
+			},
+		},
+		async applyTaskRunUpdate() {},
+		async recordTaskRunEvidence(
+			_controller: unknown,
+			entry: { outcome: string },
+		) {
+			evidence.push(entry.outcome);
+		},
+		async emit(event: LogosAgentUiEvent) {
+			if (event.type === "approval_request") {
+				approval.respond(event.request.id, true);
+				return;
+			}
+			if (event.type === "approval_resolved") {
+				throw new Error("approval resolution failed");
+			}
+		},
+	});
+
+	await assert.rejects(
+		bindRequestApproval(agent)({
+			kind: "tool",
+			toolName: "apply_edit",
+			capabilities: [],
+		}),
+		/approval resolution failed/,
+	);
+	assert.deepEqual(evidence, ["started", "failed"]);
 });
 
 test("cancelled user questions resume a TaskRun after a delayed wait update", async () => {

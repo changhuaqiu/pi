@@ -229,11 +229,12 @@ test("ToolSystem exposes descriptor-owned context history policy", () => {
 
 test("ToolSystem audits calls blocked by its shared guard", async () => {
 	const audits: ToolAuditRecord[] = [];
+	const unsafeReason = `\u001b[31mto\u200bken\u0000=guard-secret\u001b[0m ${"界".repeat(600)}`;
 	const system = createSystem({
 		audits,
 		guardToolCall(context) {
 			return context.capabilities.some((capability) => capability.kind === "fs.write")
-				? { block: true, reason: "plan required" }
+				? { block: true, reason: unsafeReason }
 				: undefined;
 		},
 	});
@@ -243,15 +244,16 @@ test("ToolSystem audits calls blocked by its shared guard", async () => {
 		}),
 	);
 
-	assert.deepEqual(
-		await system.onToolCall({
+	const decision = await system.onToolCall({
 			type: "tool_call",
 			toolCallId: "guarded-1",
 			toolName: "apply_edit",
 			input: { path: "src/index.ts" },
-		}),
-		{ block: true, reason: "plan required" },
-	);
+		});
+	assert.equal(decision?.block, true);
+	assert.match(decision?.reason ?? "", /^token=<redacted>/);
+	assert.doesNotMatch(decision?.reason ?? "", /guard-secret|\u001b|\u0000/);
+	assert.ok(Buffer.byteLength(decision?.reason ?? "", "utf8") <= 500);
 	assert.equal(audits.length, 1);
 	assert.equal(audits[0]?.phase, "decision");
 	if (audits[0]?.phase !== "decision") assert.fail("expected decision audit");
@@ -259,7 +261,35 @@ test("ToolSystem audits calls blocked by its shared guard", async () => {
 	assert.equal(audits[0].toolName, "apply_edit");
 	assert.deepEqual(audits[0].input, { path: "src/index.ts" });
 	assert.equal(audits[0].decision, "blocked");
+	assert.equal(audits[0].reason, decision?.reason);
 	assert.equal(Number.isFinite(Date.parse(audits[0].timestamp)), true);
+});
+
+test("ToolSystem governs authorization denial reasons before returning them", async () => {
+	const audits: ToolAuditRecord[] = [];
+	const system = createSystem({ audits });
+	system.register(createDescriptor("apply_edit", {
+		authorization: {
+			prepare() {
+				return {
+					kind: "deny",
+					reason: 'pass\u200bword\u0000="private words here"',
+				};
+			},
+		},
+	}));
+
+	const decision = await system.onToolCall({
+		type: "tool_call",
+		toolCallId: "authorization-denied-1",
+		toolName: "apply_edit",
+		input: {},
+	});
+	assert.deepEqual(decision, { block: true, reason: 'password="<redacted>"' });
+	assert.equal(
+		audits[0]?.phase === "decision" ? audits[0].reason : undefined,
+		'password="<redacted>"',
+	);
 });
 
 test("all Logos Agent tools register through descriptors", () => {
@@ -674,7 +704,9 @@ test("run_command authorization denial explains the supported recovery path", as
 		directoryOperations: createNodeWorkspaceDirectoryOperations(workspaceRoot),
 		commandManager: createTestCommandManager({
 			async prepare() {
-				throw new Error(`package.json does not define the requested script: smoke\n${workspaceRoot}`);
+				throw new Error(
+					`package.json does not define the requested script: smoke\nto\u200bken\u0000=command-secret\n${workspaceRoot}`,
+				);
 			},
 		}),
 	});
@@ -693,6 +725,8 @@ test("run_command authorization denial explains the supported recovery path", as
 	assert.match(preparation.reason, /package\.json does not define the requested script: smoke/);
 	assert.match(preparation.reason, /operation="npm_run"/);
 	assert.match(preparation.reason, /npx, tsx/);
+	assert.match(preparation.reason, /token=<redacted>/);
+	assert.doesNotMatch(preparation.reason, /command-secret/);
 	assert.doesNotMatch(preparation.reason, new RegExp(workspaceRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i"));
 });
 

@@ -321,14 +321,19 @@ export class LogosApprovalCard implements Component {
 			lines.push(boundedLine(` Timeout: ${Math.round(task.timeoutMs / 1000)}s`, safeWidth));
 			lines.push(chalk.dim(" This is fixed validation; arbitrary commands are not allowed."));
 		} else if (this.subject.kind === "operation") {
-			lines.push(
-				boundedLine(` ${sanitizeTerminalText(this.subject.title)}`, safeWidth),
-				boundedLine(` Action: ${sanitizeTerminalText(this.subject.action)}`, safeWidth),
-				boundedLine(` Target: ${sanitizeTerminalText(this.subject.target)}`, safeWidth),
-			);
-			this.renderedDiffLines = this.subject.facts.flatMap((fact) =>
-				wrapPlainLine(`${fact.label}: ${fact.value}`, contentWidth),
-			);
+			this.renderedDiffLines = [
+				...wrapPlainLine(this.subject.title, contentWidth).map((line) => chalk.bold(line)),
+				...wrapPlainLine(`Action: ${this.subject.action}`, contentWidth),
+				...wrapPlainLine(`Target: ${this.subject.target}`, contentWidth),
+				...this.subject.facts.flatMap((fact) =>
+					wrapPlainLine(`${fact.label}: ${fact.value}`, contentWidth),
+				),
+				...(this.subject.warning === undefined
+					? []
+					: wrapPlainLine(`Warning: ${this.subject.warning}`, contentWidth).map(
+							(line) => chalk.yellow(line),
+						)),
+			];
 			this.scrollOffset = this.clampOffset(this.scrollOffset);
 			const end = Math.min(
 				this.scrollOffset + approvalViewportRows,
@@ -337,24 +342,18 @@ export class LogosApprovalCard implements Component {
 			for (const line of this.renderedDiffLines.slice(this.scrollOffset, end)) {
 				lines.push(`  ${line}`);
 			}
-			if (this.renderedDiffLines.length > approvalViewportRows) {
-				const rangeStart = this.scrollOffset + 1;
-				lines.push(
-					chalk.dim(
-						boundedLine(
-							` ${rangeStart}-${end}/${this.renderedDiffLines.length}  ↑↓ row  PgUp/PgDn page  Home/End`,
-							safeWidth,
-						),
-					),
-				);
+			while (lines.length < 1 + approvalViewportRows) {
+				lines.push("");
 			}
-			if (this.subject.warning) {
-				lines.push(
-					...wrapPlainLine(`Warning: ${this.subject.warning}`, contentWidth).map(
-						(line) => chalk.yellow(` ${line}`),
+			const rangeStart = this.renderedDiffLines.length === 0 ? 0 : this.scrollOffset + 1;
+			lines.push(
+				chalk.dim(
+					boundedLine(
+						` ${rangeStart}-${end}/${this.renderedDiffLines.length}  ↑↓ row  PgUp/PgDn page  Home/End`,
+						safeWidth,
 					),
-				);
-			}
+				),
+			);
 		} else {
 			lines.push(boundedLine(` Tool: ${sanitizeTerminalText(this.subject.toolName)}`, safeWidth));
 			for (const capability of this.subject.capabilities) {

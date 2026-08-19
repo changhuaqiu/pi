@@ -18,7 +18,10 @@ export type LogosProgressEvent =
 			type: "approval_requested";
 			subjectKind: string;
 	  }
-	| { type: "approval_resolved"; approved: boolean }
+	| {
+			type: "approval_resolved";
+			outcome: "approved" | "rejected" | "failed";
+	  }
 	| { type: "turn_finished" }
 	| { type: "turn_aborted" };
 
@@ -214,12 +217,15 @@ export class LogosProgress {
 				break;
 
 			case "approval_resolved":
+				if (event.outcome === "failed") this.state.failures++;
 				transition(
 					this.state,
 					"reasoning",
-					event.approved
+					event.outcome === "approved"
 						? "approval granted"
-						: "revising after rejection",
+						: event.outcome === "rejected"
+							? "revising after rejection"
+							: "approval failed",
 					now,
 				);
 				break;

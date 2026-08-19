@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { stripVTControlCharacters } from "node:util";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
 export interface ToolDecisionAuditRecord {
@@ -26,6 +27,24 @@ export type ToolAuditRecord = ToolDecisionAuditRecord | ToolResultAuditRecord;
 
 export const DEFAULT_MAX_TOOL_RESULT_BYTES = 64 * 1024;
 const SENSITIVE_FIELD_NAME = /(?:^|[_-])(?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|password|secret|cookie|authorization)(?:$|[_-])/i;
+const SENSITIVE_ASSIGNMENT_KEY =
+	"api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|password|secret|cookie|authorization";
+const SENSITIVE_ASSIGNMENT_VALUE =
+	String.raw`"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*\\?$|'(?:\\.|[^'\\])*\\?$|[^\s,"'}]+`;
+
+function redactSensitiveAssignments(text: string, requireBoundary: boolean): string {
+	const pattern = new RegExp(
+		`${requireBoundary ? "\\b" : ""}(${SENSITIVE_ASSIGNMENT_KEY})(\\s*[:=]\\s*)(${SENSITIVE_ASSIGNMENT_VALUE})`,
+		"gi",
+	);
+	return text.replace(
+		pattern,
+		(_match: string, key: string, separator: string, value: string): string => {
+			const quote = value.startsWith('"') ? '"' : value.startsWith("'") ? "'" : "";
+			return `${key}${separator}${quote}<redacted>${quote}`;
+		},
+	);
+}
 
 export interface AuditTextSummary {
 	bytes: number;
@@ -121,13 +140,38 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function redactSensitiveText(text: string, root: string): string {
 	let result = text.replaceAll(root, "<workspace>").replaceAll(root.replaceAll("\\", "/"), "<workspace>");
 	result = result.replace(/((?:Bearer|Basic)\s+)[^\s]+/gi, "$1<redacted>");
-	result = result.replace(
-		/\b(api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|token|password|secret|cookie|authorization)(\s*[:=]\s*)(["']?)[^\s,"'}]+/gi,
-		"$1$2$3<redacted>",
-	);
+	result = redactSensitiveAssignments(result, true);
 	result = result.replace(/\bsk-[A-Za-z0-9_-]{20,}\b/g, "<redacted-key>");
 	result = result.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, "<redacted-key>");
 	return result.replace(/\bAKIA[0-9A-Z]{16}\b/g, "<redacted-key>");
+}
+
+export function redactSensitiveSingleLineText(
+	text: string,
+	root: string,
+	maxBytes: number,
+): string {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+		throw new Error("Single-line text byte limit must be a positive safe integer");
+	}
+	const normalized = stripVTControlCharacters(text)
+		.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, "")
+		.normalize("NFKC");
+	const redacted = redactSensitiveAssignments(
+		redactSensitiveText(normalized, root),
+		false,
+	)
+		.replace(/\s+/g, " ")
+		.trim();
+	const buffer = Buffer.from(redacted, "utf8");
+	if (buffer.length <= maxBytes) return redacted;
+	const suffix = "…";
+	const suffixBytes = Buffer.byteLength(suffix, "utf8");
+	if (maxBytes < suffixBytes) return ".".repeat(maxBytes);
+	const contentBytes = maxBytes - suffixBytes;
+	let end = contentBytes;
+	while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+	return `${buffer.subarray(0, end).toString("utf8")}${suffix}`;
 }
 
 function boundRedactedText(text: string, maxBytes: number): string {

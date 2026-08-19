@@ -201,7 +201,17 @@ test("operation approval is sanitized, bounded, and rendered generically", () =>
 		target: `${workspaceRoot}\\service-a`,
 		facts: Array.from({ length: 20 }, (_, index) => ({
 			label: `Fact ${index}`,
-			value: index === 0 ? "to\u200bken=private" : `value-${index}`,
+			value: index === 0
+				? "to\u200bken=private"
+				: index === 1
+					? 'password="correct horse battery staple"'
+					: index === 2
+						? "secret='alpha beta gamma'"
+						: index === 3
+							? 'password="secret' + "\\"
+							: index === 4
+								? "secret='private" + "\\"
+								: `value-${index}`,
 		})),
 		warning: "Production change",
 	}, workspaceRoot);
@@ -209,6 +219,10 @@ test("operation approval is sanitized, bounded, and rendered generically", () =>
 	if (subject.kind !== "operation") assert.fail("expected operation approval");
 	assert.equal(subject.facts.length, 12);
 	assert.equal(subject.facts[0]?.value, "token=<redacted>");
+	assert.equal(subject.facts[1]?.value, 'password="<redacted>"');
+	assert.equal(subject.facts[2]?.value, "secret='<redacted>'");
+	assert.equal(subject.facts[3]?.value, 'password="<redacted>"');
+	assert.equal(subject.facts[4]?.value, "secret='<redacted>'");
 	assert.match(subject.target, /<workspace>/);
 	assert.doesNotMatch(subject.title, /\u001b/);
 
@@ -217,9 +231,38 @@ test("operation approval is sanitized, bounded, and rendered generically", () =>
 	assert.match(output, /Deploy service/);
 	assert.match(output, /business\.deployment\.execute/);
 	assert.match(output, /token=<redacted>/);
-	assert.match(output, /Warning: Production change/);
+	card.scrollToEnd();
+	assert.match(card.render(64).join("\n"), /Warning: Production change/);
 	for (const line of card.render(36)) {
 		assert.ok(visibleWidth(line) <= 36, `${visibleWidth(line)} exceeds 36`);
+	}
+});
+
+test("operation approval keeps target and warning tails reachable in a fixed viewport", () => {
+	const targetTail = "TARGET_REVIEW_TAIL";
+	const warningTail = "WARNING_REVIEW_TAIL";
+	const card = new LogosApprovalCard({
+		kind: "operation",
+		title: "Deploy service",
+		action: "business.deployment.execute",
+		target: `service-${"target-segment-".repeat(24)}${targetTail}`,
+		facts: [],
+		warning: `production-${"risk-segment-".repeat(20)}${warningTail}`,
+	});
+
+	const firstPage = card.render(40);
+	assert.equal(firstPage.length, 16);
+	assert.doesNotMatch(firstPage.join("\n"), new RegExp(warningTail));
+	assert.match(firstPage.join("\n"), /\[y\] approve once/);
+	card.scrollToEnd();
+	const lastPage = card.render(40);
+	assert.equal(lastPage.length, 16);
+	const compactLastPage = lastPage.join("\n").replace(/\s+/g, "");
+	assert.match(compactLastPage, new RegExp(targetTail));
+	assert.match(compactLastPage, new RegExp(warningTail));
+	assert.match(lastPage.join("\n"), /\[y\] approve once/);
+	for (const line of [...firstPage, ...lastPage]) {
+		assert.ok(visibleWidth(line) <= 40, `${visibleWidth(line)} exceeds 40`);
 	}
 });
 

@@ -1,4 +1,3 @@
-import { stripVTControlCharacters } from "node:util";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	createAskUserTool,
@@ -78,7 +77,10 @@ import {
 	type ToolAuthorizationContext,
 	type ToolCapability,
 } from "./tool-system.ts";
-import { redactSensitiveText, summarizeAuditText } from "./tool-security.ts";
+import {
+	redactSensitiveSingleLineText,
+	summarizeAuditText,
+} from "./tool-security.ts";
 import {
 	createWorkspaceInfoTool,
 	type WorkspaceInfoOperations,
@@ -129,20 +131,13 @@ function boundedApprovalText(
 	maxBytes: number,
 	workspaceRoot: string,
 ): string {
-	const normalized = stripVTControlCharacters(value)
-		.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, "")
-		.normalize("NFKC");
-	const sanitized = redactSensitiveText(normalized, workspaceRoot)
-		.replace(/\s+/g, " ")
-		.trim();
+	const sanitized = redactSensitiveSingleLineText(
+		value,
+		workspaceRoot,
+		maxBytes,
+	);
 	if (!sanitized) throw new Error(`${label} must contain visible text`);
-	const buffer = Buffer.from(sanitized, "utf8");
-	if (buffer.length <= maxBytes) return sanitized;
-	const suffix = "…";
-	const contentBytes = maxBytes - Buffer.byteLength(suffix, "utf8");
-	let end = Math.max(0, contentBytes);
-	while (end > 0 && (buffer[end]! & 0xc0) === 0x80) end -= 1;
-	return `${buffer.subarray(0, end).toString("utf8")}${suffix}`;
+	return sanitized;
 }
 
 export function governLogosApprovalSubject(
@@ -241,10 +236,7 @@ export function createGenericLogosApprovalSubject(
 
 function commandAuthorizationDenial(error: unknown, workspaceRoot: string): string {
 	const rawMessage = error instanceof Error ? error.message : String(error);
-	const safeMessage = redactSensitiveText(rawMessage, workspaceRoot)
-		.replace(/[\r\n\t]+/g, " ")
-		.trim()
-		.slice(0, 500);
+	const safeMessage = redactSensitiveSingleLineText(rawMessage, workspaceRoot, 500);
 	return [
 		`run_command rejected: ${safeMessage || "the requested project command is not allowed"}.`,
 		"Use operation=\"npm_run\" with an existing package.json script, or operation=\"npm_install\".",
