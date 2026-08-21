@@ -9,17 +9,22 @@ test("CLI defaults to interactive mode", () => {
 test("CLI parses isolated print runs with optional approval", () => {
 	assert.deepEqual(parseLogosAgentCliOptions(["--print", "inspect the workspace"]), {
 		mode: "print",
-		prompt: "inspect the workspace",
+		prompt: { source: "argument", value: "inspect the workspace" },
 		autoApprove: false,
 	});
 	assert.deepEqual(
 		parseLogosAgentCliOptions(["--yes", "-p", "fix the failing test"]),
 		{
 			mode: "print",
-			prompt: "fix the failing test",
+			prompt: { source: "argument", value: "fix the failing test" },
 			autoApprove: true,
 		},
 	);
+	assert.deepEqual(parseLogosAgentCliOptions(["--yes", "--print", "-"]), {
+		mode: "print",
+		prompt: { source: "stdin" },
+		autoApprove: true,
+	});
 });
 
 test("CLI rejects ambiguous print arguments", () => {

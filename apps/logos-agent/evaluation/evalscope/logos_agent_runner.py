@@ -76,8 +76,20 @@ class LogosAgentRunner(AgentRunner):
         command = [*self._command, *self._extra_args]
         if self._auto_approve:
             command.append("--yes")
-        command.extend(["--print", task.instruction])
-        result = await env.exec(command, timeout=task.timeout, env=env_vars)
+        # EvalScope 1.10 Enclave environments accept `input` but do not pipe it
+        # to the process, so only the local environment can use stdin safely.
+        use_stdin = getattr(env, "name", "") == "local"
+        command.extend(
+            ["--print", "-"]
+            if use_stdin
+            else ["--print", task.instruction]
+        )
+        result = await env.exec(
+            command,
+            input=task.instruction if use_stdin else None,
+            timeout=task.timeout,
+            env=env_vars,
+        )
         if result.timed_out:
             raise RunnerTimeoutError(
                 f"logos-agent timed out after {task.timeout}s "

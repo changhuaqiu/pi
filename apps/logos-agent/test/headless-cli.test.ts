@@ -8,6 +8,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 test("print mode sends Chat Completions to a configurable endpoint", async () => {
+	const prompt = "first line\n\nsecond line with a question?";
 	const requests: unknown[] = [];
 	const server = createServer(async (request, response) => {
 		const chunks: Buffer[] = [];
@@ -66,7 +67,7 @@ test("print mode sends Chat Completions to a configurable endpoint", async () =>
 		}>((resolvePromise, rejectPromise) => {
 			const child = spawn(
 				process.execPath,
-				[fileURLToPath(new URL("../src/main.ts", import.meta.url)), "--print", "你好"],
+				[fileURLToPath(new URL("../src/main.ts", import.meta.url)), "--print", "-"],
 				{
 					cwd: workspace,
 					env: {
@@ -82,10 +83,11 @@ test("print mode sends Chat Completions to a configurable endpoint", async () =>
 						LOGOS_AGENT_WORKSPACE: ".",
 						LOGOS_AGENT_OBSERVABILITY_ENDPOINT: "",
 					},
-					stdio: ["ignore", "pipe", "pipe"],
+					stdio: ["pipe", "pipe", "pipe"],
 					windowsHide: true,
 				},
 			);
+			child.stdin.end(prompt);
 			let stdout = "";
 			let stderr = "";
 			child.stdout.on("data", (chunk: Buffer) => {
@@ -104,11 +106,56 @@ test("print mode sends Chat Completions to a configurable endpoint", async () =>
 			(requests[0] as { model?: unknown }).model,
 			"evaluation-model",
 		);
+		const messages = (requests[0] as {
+			messages?: Array<{ role?: unknown; content?: unknown }>;
+		}).messages;
+		assert.ok(messages);
+		assert.deepEqual(messages.at(-1), {
+			role: "user",
+			content: [{ type: "text", text: prompt }],
+		});
 	} finally {
 		await rm(workspace, { recursive: true, force: true });
 		server.closeAllConnections();
 		await new Promise<void>((resolvePromise, rejectPromise) => {
 			server.close((error) => (error ? rejectPromise(error) : resolvePromise()));
 		});
+	}
+});
+
+test("print mode rejects empty stdin", async () => {
+	const workspace = await mkdtemp(join(tmpdir(), "logos-agent-cli-empty-test-"));
+	try {
+		const result = await new Promise<{
+			code: number | null;
+			stderr: string;
+		}>((resolvePromise, rejectPromise) => {
+			const child = spawn(
+				process.execPath,
+				[fileURLToPath(new URL("../src/main.ts", import.meta.url)), "--print", "-"],
+				{
+					cwd: workspace,
+					env: {
+						...process.env,
+						LOGOS_AGENT_LOAD_PERSISTENT_ENV: "false",
+						LOGOS_AGENT_WORKSPACE: ".",
+						LOGOS_AGENT_OBSERVABILITY_ENDPOINT: "",
+					},
+					stdio: ["pipe", "ignore", "pipe"],
+					windowsHide: true,
+				},
+			);
+			child.stdin.end();
+			let stderr = "";
+			child.stderr.on("data", (chunk: Buffer) => {
+				stderr += chunk.toString("utf8");
+			});
+			child.once("error", rejectPromise);
+			child.once("close", (code) => resolvePromise({ code, stderr }));
+		});
+		assert.notEqual(result.code, 0);
+		assert.match(result.stderr, /No prompt received on stdin/);
+	} finally {
+		await rm(workspace, { recursive: true, force: true });
 	}
 });

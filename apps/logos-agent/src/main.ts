@@ -231,7 +231,18 @@ async function main(): Promise<void> {
 		return;
 	}
 	if (options.mode === "print") {
-		await runPrint(options.prompt, options.autoApprove);
+		let prompt: string;
+		if (options.prompt.source === "stdin") {
+			const chunks: Buffer[] = [];
+			for await (const chunk of process.stdin) {
+				chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+			}
+			prompt = Buffer.concat(chunks).toString("utf8");
+			if (!prompt.trim()) throw new Error("No prompt received on stdin");
+		} else {
+			prompt = options.prompt.value;
+		}
+		await runPrint(prompt, options.autoApprove);
 		return;
 	}
 	await runInteractive();

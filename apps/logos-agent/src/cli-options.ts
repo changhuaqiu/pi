@@ -1,6 +1,12 @@
 export type LogosAgentCliOptions =
 	| { mode: "interactive" }
-	| { mode: "print"; prompt: string; autoApprove: boolean }
+	| {
+			mode: "print";
+			prompt:
+				| { source: "argument"; value: string }
+				| { source: "stdin" };
+			autoApprove: boolean;
+	  }
 	| { mode: "help" }
 	| { mode: "version" };
 
@@ -8,10 +14,12 @@ export const logosAgentUsage = [
 	"Usage:",
 	"  logos-agent",
 	"  logos-agent --print <prompt> [--yes]",
+	"  logos-agent --print - [--yes]",
 	"  logos-agent --version",
 	"",
 	"Options:",
 	"  -p, --print  Run one prompt without the TUI and print only the final answer.",
+	"               Use - to read the prompt from stdin.",
 	"  --yes        Approve tool actions that would normally ask for confirmation.",
 	"  -h, --help   Show this help.",
 	"  -v, --version  Show the installed version.",
@@ -33,7 +41,14 @@ export function parseLogosAgentCliOptions(args: readonly string[]): LogosAgentCl
 		(remaining[0] === "--print" || remaining[0] === "-p") &&
 		remaining[1]?.trim()
 	) {
-		return { mode: "print", prompt: remaining[1], autoApprove };
+		return {
+			mode: "print",
+			prompt:
+				remaining[1] === "-"
+					? { source: "stdin" }
+					: { source: "argument", value: remaining[1] },
+			autoApprove,
+		};
 	}
 
 	throw new Error(`Invalid arguments\n\n${logosAgentUsage}`);
