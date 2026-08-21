@@ -147,6 +147,10 @@ import {
 	type LogosAgentObservabilityConfig,
 	type LogosAgentTurnResult,
 } from "./observability.ts";
+import {
+	createOpenAICompatibleProvider,
+	type OpenAICompatibleProviderConfig,
+} from "./openai-compatible-provider.ts";
 
 export type LogosAgentEvent =
 	| AgentHarnessEvent
@@ -282,8 +286,9 @@ export interface LogosAgentConfig {
 	workspaceRoot: string;
 	validationRoot: string;
 	sessionsRoot: string;
-	provider: "openai" | "anthropic" | "deepseek";
+	provider: "openai" | "anthropic" | "deepseek" | "openai-compatible";
 	modelId: string;
+	openAICompatible?: OpenAICompatibleProviderConfig;
 	thinkingLevel?: ThinkingLevel;
 	tavilyApiKey?: string;
 	cacheEnvironment: CacheObservationEnvironment;
@@ -360,7 +365,14 @@ function createModel(config: LogosAgentConfig): { models: Models; model: Model<a
 			? openaiProvider()
 			: config.provider === "anthropic"
 				? anthropicProvider()
-				: deepseekProvider();
+				: config.provider === "deepseek"
+					? deepseekProvider()
+					: config.openAICompatible
+						? createOpenAICompatibleProvider(config.openAICompatible)
+						: undefined;
+	if (!provider) {
+		throw new Error("OpenAI-compatible provider configuration is required");
+	}
 	models.setProvider(provider);
 	const model = models.getModel(config.provider, config.modelId);
 	if (!model) throw new Error(`Unknown model: ${config.provider}/${config.modelId}`);
@@ -376,6 +388,9 @@ function assertCredentials(provider: LogosAgentConfig["provider"]): void {
 	}
 	if (provider === "deepseek" && !process.env.DEEPSEEK_API_KEY) {
 		throw new Error("DEEPSEEK_API_KEY is required for the DeepSeek provider");
+	}
+	if (provider === "openai-compatible" && !process.env.LOGOS_AGENT_API_KEY) {
+		throw new Error("LOGOS_AGENT_API_KEY is required for the OpenAI-compatible provider");
 	}
 }
 
