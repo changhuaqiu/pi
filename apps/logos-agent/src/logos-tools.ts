@@ -345,19 +345,19 @@ export function createLogosToolDescriptors(
 		},
 		{
 			tool: listFiles,
-			capabilities: [{ kind: "fs.read", scope: "workspace" }],
+			capabilities: [{ kind: "fs.read", scope: "workspace-or-explicit-absolute-path" }],
 			defaultPermission: "allow",
 			context: { history: "compact" },
 		},
 		{
 			tool: readFile,
-			capabilities: [{ kind: "fs.read", scope: "workspace" }],
+			capabilities: [{ kind: "fs.read", scope: "workspace-or-explicit-absolute-path" }],
 			defaultPermission: "allow",
 			context: { history: "compact" },
 		},
 		{
 			tool: grep,
-			capabilities: [{ kind: "fs.read", scope: "workspace" }],
+			capabilities: [{ kind: "fs.read", scope: "workspace-or-explicit-absolute-path" }],
 			defaultPermission: "allow",
 			context: { history: "compact" },
 		},

@@ -12,11 +12,13 @@ import {
 } from "../src/read-only-tools.ts";
 
 let workspaceRoot = "";
+let externalRoot = "";
 let operations: ReadOnlyWorkspaceOperations;
 let symlinkReadPath: string | undefined;
 
 before(async () => {
 	workspaceRoot = await mkdtemp(join(tmpdir(), "logos-agent-read-tools-"));
+	externalRoot = await mkdtemp(join(tmpdir(), "logos-agent-external-read-tools-"));
 	await mkdir(join(workspaceRoot, "src"));
 	await mkdir(join(workspaceRoot, "node_modules"));
 	await mkdir(join(workspaceRoot, ".data"));
@@ -34,6 +36,9 @@ before(async () => {
 	await writeFile(join(workspaceRoot, ".ssh", "secret.txt"), "not-readable\n");
 	await writeFile(join(workspaceRoot, "test", "match.ts"), "segment-glob-marker\n");
 	await writeFile(join(workspaceRoot, "contest", "false-positive.ts"), "segment-glob-marker\n");
+	await mkdir(join(externalRoot, "src"));
+	await writeFile(join(externalRoot, "src", "external.ts"), "const externalReadMarker = true;\n");
+	await writeFile(join(externalRoot, ".env"), "EXTERNAL_SECRET=not-readable\n");
 	await writeFile(
 		join(workspaceRoot, "src", "context.ts"),
 		["inject provider context", "context memory inject"].join("\n"),
@@ -71,6 +76,7 @@ before(async () => {
 after(async () => {
 	assert.equal(isAbsolute(workspaceRoot), true);
 	await rm(workspaceRoot, { recursive: true, force: true });
+	await rm(externalRoot, { recursive: true, force: true });
 });
 
 test("list_files returns bounded entries and excludes sensitive trees", async () => {
@@ -123,12 +129,37 @@ test("read_file marks only a complete first-to-last range as full coverage", asy
 	assert.match(text, /coverage=complete/);
 });
 
-test("read_file blocks traversal, absolute paths, and credential files", async () => {
+test("read_file blocks traversal and credential files", async () => {
 	const tool = createReadFileTool(operations);
 
 	await assert.rejects(tool.execute("read-2", { path: "../outside.ts" }), /traversal/);
-	await assert.rejects(tool.execute("read-3", { path: workspaceRoot }), /workspace-relative/);
-	await assert.rejects(tool.execute("read-4", { path: ".env" }), /Sensitive file/);
+	await assert.rejects(tool.execute("read-3", { path: ".env" }), /Sensitive file/);
+	await assert.rejects(tool.execute("read-4", { path: join(externalRoot, ".env") }), /Sensitive file/);
+	await assert.rejects(tool.execute("read-network", { path: "\\\\server\\share\\file.ts" }), /Network paths/);
+});
+
+test("read-only tools accept explicit absolute paths outside the workspace", async () => {
+	const externalFile = join(externalRoot, "src", "external.ts");
+	const displayFile = externalFile.replaceAll("\\", "/");
+	const listed = await createListFilesTool(operations).execute("list-external", {
+		path: externalRoot,
+		depth: 2,
+		maxEntries: 20,
+	});
+	const read = await createReadFileTool(operations).execute("read-external", { path: externalFile });
+	const grep = await createGrepTool(operations).execute("grep-external", {
+		pattern: "externalReadMarker",
+		path: externalRoot,
+	});
+	const listedText = listed.content[0]?.type === "text" ? listed.content[0].text : "";
+	const readText = read.content[0]?.type === "text" ? read.content[0].text : "";
+	const grepText = grep.content[0]?.type === "text" ? grep.content[0].text : "";
+
+	assert.match(listedText, new RegExp(JSON.stringify(displayFile).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	assert.equal(read.details.path, displayFile);
+	assert.match(readText, /externalReadMarker/);
+	assert.match(grepText, new RegExp(JSON.stringify(displayFile).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	assert.equal(grep.details.resultCount, 1);
 });
 
 test("read_file rejects Windows aliases and alternate data streams", async () => {
@@ -146,6 +177,10 @@ test("read_file rejects direct symbolic links before resolving their target", as
 	}
 	await assert.rejects(
 		createReadFileTool(operations).execute("read-symlink", { path: symlinkReadPath }),
+		/Symbolic links are not readable/,
+	);
+	await assert.rejects(
+		createReadFileTool(operations).execute("read-absolute-symlink", { path: join(workspaceRoot, symlinkReadPath) }),
 		/Symbolic links are not readable/,
 	);
 });
@@ -203,6 +238,23 @@ test("grep supports regular expressions and excludes blocked trees", async () =>
 	assert.equal(result.details.resultCount, 2);
 });
 
+test("grep trusts blocked-looking ancestors above the workspace root", async () => {
+	const parent = await mkdtemp(join(tmpdir(), "logos-agent-nested-workspace-"));
+	const nestedRoot = join(parent, "node_modules", "workspace");
+	try {
+		await mkdir(nestedRoot, { recursive: true });
+		await writeFile(join(nestedRoot, "visible.ts"), "const nestedWorkspaceMarker = true;\n");
+		const nestedOperations = createNodeReadOnlyWorkspaceOperations(nestedRoot);
+		const result = await createGrepTool(nestedOperations).execute("grep-nested-workspace", {
+			pattern: "nestedWorkspaceMarker",
+		});
+
+		assert.equal(result.details.resultCount, 1);
+	} finally {
+		await rm(parent, { recursive: true, force: true });
+	}
+});
+
 test("grep enforces result and traversal bounds", async () => {
 	const tool = createGrepTool(operations);
 	const limited = await tool.execute("grep-2", { pattern: "self-iteration", maxResults: 1 });
@@ -222,7 +274,7 @@ test("grep supports glob, file, count, context, and offset modes", async () => {
 		outputMode: "files",
 	});
 	const counts = await tool.execute("grep-counts", {
-		pattern: "Learning|self-iteration",
+		pattern: "LogosAgent|self-iteration",
 		path: "src",
 		outputMode: "count",
 	});

@@ -21,8 +21,14 @@ test("core prompt defines an end-to-end coding agent contract", () => {
 	assert.match(codeAgentSystemPrompt, /Write for a person, not an execution log/);
 	assert.match(codeAgentSystemPrompt, /Keep simple results to one or two short paragraphs/);
 	assert.match(codeAgentSystemPrompt, /Do not replay the tool sequence/);
+	assert.match(codeAgentSystemPrompt, /Do not restate the request before answering it/);
+	assert.match(codeAgentSystemPrompt, /describe how the real components relate in plain language/);
+	assert.match(codeAgentSystemPrompt, /do not manufacture illustrative APIs/);
+	assert.match(codeAgentSystemPrompt, /Use a code block only when the user asks for code/);
+	assert.match(codeAgentSystemPrompt, /Avoid canned essay structure/);
 	assert.match(codeAgentSystemPrompt, /not as mandatory report sections/);
 	assert.match(codeAgentSystemPrompt, /Never claim that a file changed/);
+	assert.match(codeAgentSystemPrompt, /absolute path outside the workspace only when the user explicitly names/);
 });
 
 test("core prompt distinguishes ordinary turns from execution tasks", () => {

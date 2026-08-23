@@ -691,6 +691,9 @@ export class HarnessLogosAgent implements LogosAgent {
 			model: this.model,
 			tools: toolSystem.getTools(),
 			systemPrompt: buildSystemPrompt,
+			streamOptions: {
+				maxRetries: 2,
+			},
 			thinkingLevel: resolveLogosThinkingLevel(
 				this.model.reasoning,
 				this.config.thinkingLevel,

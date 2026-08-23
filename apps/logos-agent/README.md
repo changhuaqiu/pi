@@ -19,7 +19,7 @@ TUI -> LogosAgent -> AgentHarness -> Agent loop -> Provider
 当前边界：
 
 - 连接 OpenAI 或 Anthropic 的真实模型，不在运行时使用 Faux Provider。
-- 提供 `workspace_info`、`list_files`、`read_file`、`grep` 四个工作区只读工具。
+- 提供 `workspace_info`、`list_files`、`read_file`、`grep` 四个有界只读工具。
 - 提供默认允许的 `ask_user`，在关键需求无法从工作区确认时暂停并显示带说明的选择界面。
 - 提供 `git_status`、`git_diff`、`git_log`、`git_show`、`git_blame` 五个 Git 只读工具。
 - 提供 `propose_patch`、`propose_create_file`、`propose_delete_file` 和 `apply_edit` 受控编辑工具。
@@ -27,7 +27,7 @@ TUI -> LogosAgent -> AgentHarness -> Agent loop -> Provider
 - 提供默认自动允许的 `run_task`，仅能运行 Logos Agent 测试或类型检查。
 - 提供默认自动允许的 `run_command`，用于安装 npm 依赖、运行 `package.json` 脚本和管理开发服务器。
 - 提供只读的 `command_status` 与默认自动允许的 `stop_command`，用于检查和终止受管进程树。
-- 只能读取注入工作区内的有界元数据、目录结构和文本源码。
+- `workspace_info` 只读取注入工作区；`list_files`、`read_file`、`grep` 的相对路径仍以工作区为根，也可通过显式绝对路径读取其他本地目录。所有写入、Git 和命令能力仍受工作区限制。
 - 工具执行支持 `AbortSignal` 和 `onUpdate`。
 - `beforeToolCall` 产生审计事件，`afterToolCall` 对结果脱敏。
 - 不提供 shell 字符串、管道、重定向、环境覆盖或任意可执行文件；项目命令使用结构化参数和 `shell: false`。
@@ -98,11 +98,12 @@ Git 读取边界：
 
 代码读取边界：
 
-- 只接受工作区相对路径，拒绝绝对路径和 `..`。
+- `workspace_info` 只查看当前工作区的有界元数据。
+- `list_files`、`read_file`、`grep` 接受工作区相对路径或显式绝对本地路径；相对路径拒绝 `..`，网络路径始终拒绝。
 - 不跟随目录树中的符号链接。
 - 排除 `.git`、`.data`、`node_modules`、环境文件、私钥和常见凭据文件。
 - 文件读取、目录深度、遍历目录数、遍历条目数、结果数量和搜索文件数都有固定上限。
-- `grep` 使用有界正则表达式搜索，也可用 `literal=true` 查询精确文本；支持工作区相对路径、简单 glob、内容/文件/计数模式、上下文行和 offset 分页。为降低同步正则阻塞中断的风险，正则模式拒绝 lookaround、反向引用、量化分组和超过一个量词的表达式，并跳过超长单行。
+- `grep` 使用原生 ripgrep 正则和 glob 语义，也可用 `literal=true` 查询精确文本；支持内容/文件/计数模式、上下文行和 offset 分页，并限制扫描时间、文件数量、文件大小和输出大小。
 
 ## 安装
 

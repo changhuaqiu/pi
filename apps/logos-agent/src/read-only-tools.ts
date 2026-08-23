@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { lstat, open, readdir, realpath } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import type { AgentTool, AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
@@ -93,7 +93,10 @@ export interface ReadOnlyToolDetails {
 
 const listFilesSchema = Type.Object(
 	{
-		path: Type.Optional(Type.String({ description: "Workspace-relative directory", maxLength: 500 })),
+		path: Type.Optional(Type.String({
+			description: "Workspace-relative directory, or an explicit absolute local directory",
+			maxLength: 500,
+		})),
 		depth: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
 		maxEntries: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
 	},
@@ -102,7 +105,11 @@ const listFilesSchema = Type.Object(
 
 const readFileSchema = Type.Object(
 	{
-		path: Type.String({ description: "Workspace-relative file path", minLength: 1, maxLength: 500 }),
+		path: Type.String({
+			description: "Workspace-relative file path, or an explicit absolute local file path",
+			minLength: 1,
+			maxLength: 500,
+		}),
 		startLine: Type.Optional(Type.Integer({ minimum: 1 })),
 		maxLines: Type.Optional(Type.Integer({ minimum: 1, maximum: 500 })),
 	},
@@ -116,7 +123,10 @@ const grepSchema = Type.Object(
 			minLength: 1,
 			maxLength: 500,
 		}),
-		path: Type.Optional(Type.String({ description: "Workspace-relative file or directory", maxLength: 500 })),
+		path: Type.Optional(Type.String({
+			description: "Workspace-relative file or directory, or an explicit absolute local path",
+			maxLength: 500,
+		})),
 		glob: Type.Optional(Type.String({
 			description: "Optional ripgrep path glob, for example **/*.ts",
 			minLength: 1,
@@ -193,9 +203,15 @@ function throwIfAborted(signal?: AbortSignal): void {
 
 export function normalizeRelativePath(path: string): string {
 	const trimmed = path.trim() || ".";
+	if (trimmed.startsWith("\\\\") || trimmed.startsWith("//")) throw new Error("Network paths are not readable");
 	if (isAbsolute(trimmed)) throw new Error("Only workspace-relative paths are allowed");
 	const segments = trimmed.replaceAll("\\", "/").split("/").filter((segment) => segment && segment !== ".");
 	if (segments.includes("..")) throw new Error("Parent path traversal is not allowed");
+	validateReadableSegments(segments);
+	return segments.length === 0 ? "." : segments.join("/");
+}
+
+function validateReadableSegments(segments: string[]): void {
 	for (const segment of segments) {
 		const lower = segment.toLowerCase();
 		if (segment.includes(":")) throw new Error("NTFS alternate data stream paths are not allowed");
@@ -212,7 +228,21 @@ export function normalizeRelativePath(path: string): string {
 			throw new Error(`Sensitive file is not readable: ${segment}`);
 		}
 	}
-	return segments.length === 0 ? "." : segments.join("/");
+}
+
+function validateAbsoluteReadablePath(path: string): string[] {
+	if (path.startsWith("\\\\") || path.startsWith("//")) {
+		throw new Error("Network paths are not readable");
+	}
+	const root = parse(path).root;
+	const segments = path
+		.slice(root.length)
+		.replaceAll("\\", "/")
+		.split("/")
+		.filter((segment) => segment && segment !== ".");
+	if (segments.includes("..")) throw new Error("Parent path traversal is not allowed");
+	validateReadableSegments(segments);
+	return segments;
 }
 
 function isWithinRoot(root: string, target: string): boolean {
@@ -224,7 +254,9 @@ function isWithinRoot(root: string, target: string): boolean {
 }
 
 function toDisplayPath(root: string, target: string): string {
-	return relative(root, target).replaceAll("\\", "/") || ".";
+	return isWithinRoot(root, target)
+		? relative(root, target).replaceAll("\\", "/") || "."
+		: target.replaceAll("\\", "/");
 }
 
 function isReadableEntryName(name: string): boolean {
@@ -239,23 +271,26 @@ function isReadableEntryName(name: string): boolean {
 	);
 }
 
-async function resolveWorkspacePath(root: string, inputPath: string, signal?: AbortSignal): Promise<string> {
+async function resolveReadOnlyPath(resolvedRoot: string, inputPath: string, signal?: AbortSignal): Promise<string> {
 	throwIfAborted(signal);
-	const normalized = normalizeRelativePath(inputPath);
-	const lexicalRoot = resolve(root);
-	const lexicalTarget = resolve(lexicalRoot, normalized);
-	if (!isWithinRoot(lexicalRoot, lexicalTarget)) throw new Error("Path escapes the workspace root");
-	const resolvedRoot = await realpath(lexicalRoot);
-	throwIfAborted(signal);
-	let resolvedTarget = resolvedRoot;
-	for (const segment of normalized === "." ? [] : normalized.split("/")) {
-		resolvedTarget = resolve(resolvedTarget, segment);
-		if (!isWithinRoot(resolvedRoot, resolvedTarget)) throw new Error("Resolved path escapes the workspace root");
-		const stats = await lstat(resolvedTarget);
+	const trimmed = inputPath.trim() || ".";
+	const absoluteInput = isAbsolute(trimmed);
+	let segments: string[];
+	if (absoluteInput) {
+		segments = validateAbsoluteReadablePath(trimmed);
+	} else {
+		const normalized = normalizeRelativePath(trimmed);
+		segments = normalized === "." ? [] : normalized.split("/");
+	}
+	let target = absoluteInput ? parse(resolve(trimmed)).root : resolvedRoot;
+	for (const segment of segments) {
+		target = resolve(target, segment);
+		if (!absoluteInput && !isWithinRoot(resolvedRoot, target)) throw new Error("Resolved path escapes the workspace root");
+		const stats = await lstat(target);
 		throwIfAborted(signal);
 		if (stats.isSymbolicLink()) throw new Error("Symbolic links are not readable");
 	}
-	return resolvedTarget;
+	return target;
 }
 
 async function readBoundedTextFile(
@@ -320,16 +355,23 @@ function readRipgrepText(value: unknown): { text?: string; bytes?: string } {
 	return {};
 }
 
-function toSafeGrepPath(resolvedRoot: string, discoveredPath: string): { absolute: string; display: string } | undefined {
-	const absolute = resolve(resolvedRoot, discoveredPath);
-	if (!isWithinRoot(resolvedRoot, absolute)) return undefined;
-	const display = toDisplayPath(resolvedRoot, absolute);
+function toSafeGrepPath(
+	scanRoot: string,
+	displayRoot: string,
+	discoveredPath: string,
+): { absolute: string; display: string } | undefined {
+	const absolute = resolve(scanRoot, discoveredPath);
+	if (!isWithinRoot(scanRoot, absolute)) return undefined;
 	try {
-		normalizeRelativePath(display);
+		if (isWithinRoot(displayRoot, absolute)) {
+			normalizeRelativePath(toDisplayPath(displayRoot, absolute));
+		} else {
+			validateAbsoluteReadablePath(absolute);
+		}
 	} catch {
 		return undefined;
 	}
-	return { absolute, display };
+	return { absolute, display: toDisplayPath(displayRoot, absolute) };
 }
 
 function buildGrepDiscoveryArgs(start: string, request: WorkspaceGrepRequest): string[] {
@@ -361,7 +403,8 @@ function buildGrepDiscoveryArgs(start: string, request: WorkspaceGrepRequest): s
 
 async function discoverNativeGrepFiles(
 	rgPath: string,
-	resolvedRoot: string,
+	scanRoot: string,
+	displayRoot: string,
 	start: string,
 	request: WorkspaceGrepRequest,
 	deadline: number,
@@ -370,7 +413,7 @@ async function discoverNativeGrepFiles(
 	throwIfAborted(signal);
 	return new Promise((resolvePromise, rejectPromise) => {
 		const child = spawn(rgPath, buildGrepDiscoveryArgs(start, request), {
-			cwd: resolvedRoot,
+			cwd: scanRoot,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		const files: string[] = [];
@@ -418,7 +461,7 @@ async function discoverNativeGrepFiles(
 				stop();
 				return;
 			}
-			const safePath = toSafeGrepPath(resolvedRoot, decodedPath);
+			const safePath = toSafeGrepPath(scanRoot, displayRoot, decodedPath);
 			if (safePath === undefined) return;
 			if (files.length >= maxSearchFiles) {
 				truncated = true;
@@ -557,7 +600,8 @@ async function validateNativeGrepPattern(
 
 async function searchNativeGrepBatch(
 	rgPath: string,
-	resolvedRoot: string,
+	scanRoot: string,
+	displayRoot: string,
 	files: string[],
 	request: WorkspaceGrepRequest,
 	accumulator: NativeGrepAccumulator,
@@ -571,7 +615,7 @@ async function searchNativeGrepBatch(
 	args.push("--", request.pattern, ...files);
 
 	return new Promise((resolvePromise, rejectPromise) => {
-		const child = spawn(rgPath, args, { cwd: resolvedRoot, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(rgPath, args, { cwd: scanRoot, stdio: ["ignore", "pipe", "pipe"] });
 		const lines = createInterface({ input: child.stdout });
 		let stderr = "";
 		let aborted = false;
@@ -631,7 +675,7 @@ async function searchNativeGrepBatch(
 				return;
 			}
 			if (pathValue.text === undefined) return;
-			const safePath = toSafeGrepPath(resolvedRoot, pathValue.text);
+			const safePath = toSafeGrepPath(scanRoot, displayRoot, pathValue.text);
 			const lineNumber = data.line_number;
 			const lineValue = readRipgrepText(data.lines);
 			if (safePath === undefined || typeof lineNumber !== "number") return;
@@ -678,7 +722,8 @@ async function searchNativeGrepBatch(
 }
 
 async function runNativeGrep(
-	resolvedRoot: string,
+	scanRoot: string,
+	displayRoot: string,
 	start: string,
 	request: WorkspaceGrepRequest,
 	signal?: AbortSignal,
@@ -687,9 +732,9 @@ async function runNativeGrep(
 	const rgPath = getToolPath("rg");
 	if (!rgPath) throw new Error("ripgrep (rg) is unavailable; install rg before using grep");
 	const deadline = Date.now() + maxSearchDurationMs;
-	const discovery = await discoverNativeGrepFiles(rgPath, resolvedRoot, start, request, deadline, signal);
+	const discovery = await discoverNativeGrepFiles(rgPath, scanRoot, displayRoot, start, request, deadline, signal);
 	if (discovery.files.length === 0) {
-		await validateNativeGrepPattern(rgPath, resolvedRoot, start, request, deadline, signal);
+		await validateNativeGrepPattern(rgPath, scanRoot, start, request, deadline, signal);
 	}
 	const accumulator: NativeGrepAccumulator = {
 		matches: [],
@@ -703,7 +748,7 @@ async function runNativeGrep(
 			truncated = true;
 			break;
 		}
-		const batch = await searchNativeGrepBatch(rgPath, resolvedRoot, files, request, accumulator, deadline, signal);
+		const batch = await searchNativeGrepBatch(rgPath, scanRoot, displayRoot, files, request, accumulator, deadline, signal);
 		truncated ||= batch.truncated;
 		if (batch.stopped) break;
 	}
@@ -721,7 +766,7 @@ export function createNodeReadOnlyWorkspaceOperations(root: string): ReadOnlyWor
 		async listFiles(path, depth, maxEntries, signal) {
 			const resolvedRoot = await realpath(root);
 			throwIfAborted(signal);
-			const start = await resolveWorkspacePath(root, path, signal);
+			const start = await resolveReadOnlyPath(resolvedRoot, path, signal);
 			const stats = await lstat(start);
 			throwIfAborted(signal);
 			if (!stats.isDirectory()) throw new Error("list_files path must be a directory");
@@ -756,7 +801,7 @@ export function createNodeReadOnlyWorkspaceOperations(root: string): ReadOnlyWor
 		async readFile(path, startLine, maxLines, signal) {
 			const resolvedRoot = await realpath(root);
 			throwIfAborted(signal);
-			const target = await resolveWorkspacePath(root, path, signal);
+			const target = await resolveReadOnlyPath(resolvedRoot, path, signal);
 			const scanned = await readBoundedTextFile(target, maxReadScanBytes, signal);
 			const scannedText = scanned.buffer.toString("utf8");
 			const lastCompleteLineBreak = scanned.truncated ? scannedText.lastIndexOf("\n") : -1;
@@ -817,11 +862,16 @@ export function createNodeReadOnlyWorkspaceOperations(root: string): ReadOnlyWor
 		async grep(request, signal) {
 			const resolvedRoot = await realpath(root);
 			throwIfAborted(signal);
-			const start = await resolveWorkspacePath(root, request.path, signal);
+			const start = await resolveReadOnlyPath(resolvedRoot, request.path, signal);
 			const stats = await lstat(start);
 			throwIfAborted(signal);
 			if (!stats.isFile() && !stats.isDirectory()) throw new Error("Search path must be a file or directory");
-			const scan = await runNativeGrep(resolvedRoot, start, request, signal);
+			const scanRoot = isWithinRoot(resolvedRoot, start)
+				? resolvedRoot
+				: stats.isDirectory()
+					? start
+					: dirname(start);
+			const scan = await runNativeGrep(scanRoot, resolvedRoot, start, request, signal);
 			throwIfAborted(signal);
 			const available = request.outputMode === "content"
 				? scan.matches
@@ -891,7 +941,7 @@ export function createListFilesTool(
 		name: "list_files",
 		label: "list files",
 		description:
-			"List a bounded workspace-relative directory tree. Hidden credential files, dependency folders, sessions, Git metadata, and symlinks are excluded.",
+			"List a bounded directory tree. Relative paths stay inside the workspace; an explicit absolute local path may read another directory. Hidden credential files, dependency folders, sessions, Git metadata, network paths, and symlinks are excluded.",
 		parameters: listFilesSchema,
 		executionMode: "sequential",
 		async execute(_toolCallId, rawInput, signal, onUpdate) {
@@ -930,7 +980,7 @@ export function createReadFileTool(
 		name: "read_file",
 		label: "read file",
 		description:
-			"Read a bounded range from one text file using a workspace-relative path. The result reports exact coverage, complete, and nextStartLine; never treat a partial range as the full file. Binary, credential, dependency, session, and Git metadata files are blocked.",
+			"Read a bounded range from one text file. Relative paths stay inside the workspace; an explicit absolute local path may read another file. The result reports exact coverage, complete, and nextStartLine; never treat a partial range as the full file. Binary, credential, dependency, session, Git metadata, network paths, and symlinks are blocked.",
 		parameters: readFileSchema,
 		executionMode: "sequential",
 		async execute(_toolCallId, rawInput, signal, onUpdate) {
@@ -1035,7 +1085,7 @@ export function createGrepTool(
 		name: "grep",
 		label: "grep",
 		description:
-			"Search workspace text with native ripgrep regular-expression and glob semantics, or literal text with literal=true. Respects ignore files and enforces workspace path, sensitive-file, duration, result, and output bounds. Supports content/file/count output, context lines, case control, and offset pagination. Use grep for exact text and regex evidence; use CodeGraph tools only for indexed symbol structure and relationships.",
+			"Search text with native ripgrep regular-expression and glob semantics, or literal text with literal=true. Relative paths stay inside the workspace; an explicit absolute local path may search another file or directory. Respects ignore files and enforces sensitive-file, local-path, duration, result, and output bounds. Supports content/file/count output, context lines, case control, and offset pagination. Use grep for exact text and regex evidence; use CodeGraph tools only for indexed symbol structure and relationships.",
 		parameters: grepSchema,
 		executionMode: "sequential",
 		async execute(_toolCallId, rawInput, signal, onUpdate) {
