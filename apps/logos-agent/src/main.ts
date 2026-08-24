@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { loadEnvFile } from "node:process";
 import { fileURLToPath } from "node:url";
+import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import packageInfo from "../package.json" with { type: "json" };
-import type { ThinkingLevel } from "../../../packages/agent/src/index.ts";
 import {
 	logosAgentUsage,
 	parseLogosAgentCliOptions,
 } from "./cli-options.ts";
 import { runHeadlessPrompt } from "./headless.ts";
+import { LogosAcpServer } from "./acp/server.ts";
+import { createNodeBuzzCliOperations } from "./buzz-cli-tool.ts";
 import { HarnessLogosAgent, type LogosAgentConfig } from "./logos-agent.ts";
 import { LogosAgentTui } from "./tui-app.ts";
 import { resolveWorkspaceRoot } from "./workspace-config.ts";
@@ -71,7 +73,9 @@ function loadPersistentEnvironment(path: string): void {
 	}
 }
 
-function readConfig(options: { sessionsRoot?: string } = {}): LogosAgentConfig {
+export function readConfig(
+	options: { sessionsRoot?: string; workspaceRoot?: string } = {},
+): LogosAgentConfig {
 	const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 	if (
 		readBoolean(
@@ -93,7 +97,7 @@ function readConfig(options: { sessionsRoot?: string } = {}): LogosAgentConfig {
 		);
 	}
 	const repositoryRoot = resolve(appRoot, "..", "..");
-	const workspaceRoot = resolveWorkspaceRoot(process.env, process.cwd());
+	const workspaceRoot = options.workspaceRoot ?? resolveWorkspaceRoot(process.env, process.cwd());
 	const defaultModel =
 		providerValue === "openai"
 			? "gpt-5.5"
@@ -220,6 +224,45 @@ async function runPrint(prompt: string, autoApprove: boolean): Promise<void> {
 	}
 }
 
+async function runAcp(): Promise<void> {
+	const server = new LogosAcpServer({
+		input: process.stdin,
+		output: process.stdout,
+		agentInfo: {
+			name: "logos-agent",
+			title: "Logos Agent",
+			version: packageInfo.version,
+		},
+		createAgent: async (cwd) => {
+			const workspaceRoot = await realpath(cwd);
+			if (!(await stat(workspaceRoot)).isDirectory()) {
+				throw new Error(`ACP workspace is not a directory: ${cwd}`);
+			}
+			const config = readConfig({ workspaceRoot });
+			config.buzzCliOperations = createNodeBuzzCliOperations({ cwd: config.workspaceRoot });
+			const agent = await HarnessLogosAgent.create(config);
+			try {
+				await agent.newSession();
+				return agent;
+			} catch (error) {
+				await agent.shutdown();
+				throw error;
+			}
+		},
+	});
+	const closeInput = (): void => {
+		process.stdin.destroy();
+	};
+	process.once("SIGINT", closeInput);
+	process.once("SIGTERM", closeInput);
+	try {
+		await server.run();
+	} finally {
+		process.removeListener("SIGINT", closeInput);
+		process.removeListener("SIGTERM", closeInput);
+	}
+}
+
 async function main(): Promise<void> {
 	const options = parseLogosAgentCliOptions(process.argv.slice(2));
 	if (options.mode === "help") {
@@ -228,6 +271,10 @@ async function main(): Promise<void> {
 	}
 	if (options.mode === "version") {
 		process.stdout.write(`${packageInfo.version}\n`);
+		return;
+	}
+	if (options.mode === "acp") {
+		await runAcp();
 		return;
 	}
 	if (options.mode === "print") {

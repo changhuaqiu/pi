@@ -6,6 +6,10 @@ test("CLI defaults to interactive mode", () => {
 	assert.deepEqual(parseLogosAgentCliOptions([]), { mode: "interactive" });
 });
 
+test("CLI parses ACP stdio mode", () => {
+	assert.deepEqual(parseLogosAgentCliOptions(["acp"]), { mode: "acp" });
+});
+
 test("CLI parses isolated print runs with optional approval", () => {
 	assert.deepEqual(parseLogosAgentCliOptions(["--print", "inspect the workspace"]), {
 		mode: "print",

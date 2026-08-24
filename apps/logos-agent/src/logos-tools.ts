@@ -1,5 +1,10 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
+	createBuzzCliTool,
+	type BuzzCliOperations,
+	type BuzzCliToolDetails,
+} from "./buzz-cli-tool.ts";
+import {
 	createAskUserTool,
 	summarizeQuestionForAudit,
 	type UserQuestionOperations,
@@ -73,6 +78,7 @@ import {
 } from "./task-deliberation-tool.ts";
 import type { TaskRunAssurance } from "./task-run.ts";
 import {
+	defineBusinessToolCapability,
 	type ManagedToolDescriptor,
 	type ToolAuthorizationContext,
 	type ToolCapability,
@@ -90,6 +96,9 @@ import {
 	parseWebSearchInput,
 	type WebSearchOperations,
 } from "./web-search-tool.ts";
+
+const buzzReadCapability = defineBusinessToolCapability("business.buzz.read");
+const buzzWriteCapability = defineBusinessToolCapability("business.buzz.write");
 
 export type LogosApprovalSubject =
 	| { kind: "edit"; proposal: EditProposalSummary; impact?: CodeGraphEditImpact }
@@ -195,6 +204,7 @@ export interface LogosToolDependencies {
 	editManager: ControlledEditManager;
 	directoryOperations: WorkspaceDirectoryOperations;
 	commandManager: ControlledCommandManager;
+	buzzCliOperations?: BuzzCliOperations;
 	webSearchOperations?: WebSearchOperations;
 }
 
@@ -258,6 +268,13 @@ function projectCommandResult(event: { readonly details: unknown }): { isError: 
 function projectRunTaskResult(event: { readonly details: unknown }): { isError: boolean } | undefined {
 	if (typeof event.details !== "object" || event.details === null) return undefined;
 	const details = event.details as Partial<RunTaskToolDetails>;
+	if (details.stage !== "completed" || details.exitCode === undefined) return undefined;
+	return { isError: details.exitCode !== 0 };
+}
+
+function projectBuzzCliResult(event: { readonly details: unknown }): { isError: boolean } | undefined {
+	if (typeof event.details !== "object" || event.details === null) return undefined;
+	const details = event.details as Partial<BuzzCliToolDetails>;
 	if (details.stage !== "completed" || details.exitCode === undefined) return undefined;
 	return { isError: details.exitCode !== 0 };
 }
@@ -703,6 +720,42 @@ export function createLogosToolDescriptors(
 			guidance: [
 				"You have live public-web access through web_search. When the user asks to browse, search, research competitors, or verify current information, call web_search before answering; never claim that internet access is unavailable without attempting the tool.",
 				"If results are weak or irrelevant, refine the query, search for official project or product names, and clearly distinguish strong evidence from weak search results.",
+			],
+		});
+	}
+	if (dependencies.buzzCliOperations) {
+		descriptors.push({
+			tool: createBuzzCliTool(dependencies.buzzCliOperations),
+			capabilities: [
+				{ kind: buzzReadCapability, scope: "authenticated-buzz-community" },
+				{ kind: buzzWriteCapability, scope: "authenticated-buzz-community" },
+				{ kind: "network.access", scope: "configured-buzz-relay" },
+			],
+			defaultPermission: "ask",
+			audit: {
+				summarizeInput(input) {
+					const args = Array.isArray(input.args) ? input.args : [];
+					const argumentSummary = summarizeAuditText(JSON.stringify(args));
+					const stdinSummary = summarizeAuditText(
+						typeof input.stdin === "string" ? input.stdin : "",
+					);
+					return {
+						argumentCount: args.length,
+						argumentsBytes: argumentSummary.bytes,
+						argumentsHash: argumentSummary.sha256,
+						stdinBytes: stdinSummary.bytes,
+						stdinHash: stdinSummary.sha256,
+					};
+				},
+			},
+			context: {
+				maxBytes: 64 * 1024,
+				history: "compact",
+				project: projectBuzzCliResult,
+			},
+			guidance: [
+				"In a Buzz-managed session, use buzz_cli to publish every requested answer, result, blocker, or necessary question to the originating channel; assistant text alone is not delivered to channel members.",
+				"Use the channel UUID and reply destination supplied by the Buzz prompt context, and prefer --content - with stdin for multiline messages.",
 			],
 		});
 	}

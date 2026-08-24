@@ -35,6 +35,7 @@ import {
 	type UserQuestionResolution,
 	type UserQuestionResponse,
 } from "./ask-user-tool.ts";
+import type { BuzzCliOperations } from "./buzz-cli-tool.ts";
 import {
 	type CodeIntelligenceProvider,
 	createCodeGraphProvider,
@@ -291,6 +292,7 @@ export interface LogosAgentConfig {
 	openAICompatible?: OpenAICompatibleProviderConfig;
 	thinkingLevel?: ThinkingLevel;
 	tavilyApiKey?: string;
+	buzzCliOperations?: BuzzCliOperations;
 	cacheEnvironment: CacheObservationEnvironment;
 	observability?: LogosAgentObservabilityConfig;
 }
@@ -633,6 +635,7 @@ export class HarnessLogosAgent implements LogosAgent {
 				this.config.workspaceRoot,
 			),
 			commandManager: this.commandManager,
+			buzzCliOperations: this.config.buzzCliOperations,
 			webSearchOperations,
 		})) {
 			toolSystem.register(descriptor);

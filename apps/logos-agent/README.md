@@ -135,6 +135,30 @@ npm run logos-agent
 从其他已打开的项目目录启动时，可使用 `npm --prefix <pi 仓库路径> run logos-agent`；
 Logos Agent 会把执行该命令前的项目目录作为工作区，而不是把 pi 仓库当作工作区。
 
+### 接入 Buzz（ACP）
+
+Logos Agent 可作为 ACP stdio 子进程由 `buzz-acp` 托管。先确保 `logos-agent` 与
+`buzz` 命令都在 `PATH`，并配置 Logos Provider 与 Buzz 身份：
+
+```powershell
+$env:OPENAI_API_KEY="..."
+$env:BUZZ_PRIVATE_KEY="nsec1..."
+$env:BUZZ_RELAY_URL="ws://localhost:3000"
+$env:BUZZ_ACP_AGENT_COMMAND="logos-agent"
+$env:BUZZ_ACP_AGENT_ARGS="acp"
+buzz-acp
+```
+
+也可独立运行 `logos-agent acp`；该模式只在 stdout 输出逐行 JSON-RPC，诊断写入
+stderr。Buzz 为每个频道创建独立 ACP Session，并把频道工作区作为 `session/new.cwd`
+传入。Logos Agent 会为每个 ACP Session 创建独立运行时与 JSONL Session。
+
+ACP Session 额外提供受控 `buzz_cli` 工具。它固定执行 `buzz`、使用参数数组和
+`shell: false`，限制环境、运行时间与输出大小，并让写操作继续经过 Logos 的逐次审批。
+回复正文建议通过 `--content -` 和 stdin 传递。Buzz 频道成员看不到 ACP 中的模型文本和
+工具轨迹，因此 Agent 必须使用 `buzz_cli` 的 `messages send` 发布答案、结果、阻塞或问题。
+具体协议映射和边界见 [docs/acp-adapter.md](docs/acp-adapter.md)。
+
 Anthropic：
 
 ```powershell

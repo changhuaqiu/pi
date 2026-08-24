@@ -1,5 +1,6 @@
 export type LogosAgentCliOptions =
 	| { mode: "interactive" }
+	| { mode: "acp" }
 	| {
 			mode: "print";
 			prompt:
@@ -13,11 +14,13 @@ export type LogosAgentCliOptions =
 export const logosAgentUsage = [
 	"Usage:",
 	"  logos-agent",
+	"  logos-agent acp",
 	"  logos-agent --print <prompt> [--yes]",
 	"  logos-agent --print - [--yes]",
 	"  logos-agent --version",
 	"",
 	"Options:",
+	"  acp          Run as an ACP agent over stdio for Buzz and other ACP clients.",
 	"  -p, --print  Run one prompt without the TUI and print only the final answer.",
 	"               Use - to read the prompt from stdin.",
 	"  --yes        Approve tool actions that would normally ask for confirmation.",
@@ -27,6 +30,7 @@ export const logosAgentUsage = [
 
 export function parseLogosAgentCliOptions(args: readonly string[]): LogosAgentCliOptions {
 	if (args.length === 0) return { mode: "interactive" };
+	if (args.length === 1 && args[0] === "acp") return { mode: "acp" };
 	if (args.length === 1 && (args[0] === "--help" || args[0] === "-h")) {
 		return { mode: "help" };
 	}
