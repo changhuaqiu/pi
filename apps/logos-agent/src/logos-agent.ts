@@ -1,4 +1,5 @@
-import { mkdir } from "node:fs/promises";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 // The globally linked bin runs this TypeScript file directly with Node. Import the
 // workspace source explicitly so runtime behavior cannot lag behind an unbuilt dist/.
@@ -109,11 +110,21 @@ import {
 } from "./workspace-instructions.ts";
 import { createConfiguredWebSearchOperations } from "./web-search-tool.ts";
 import { SessionTaskRunJournal } from "./session-task-run-journal.ts";
+import { SessionExecutionJournal } from "./session-execution-journal.ts";
+import {
+	ExecutionController,
+	type ExecutionMessageRole,
+	type ExecutionOutcome,
+	type ExecutionState,
+	type ExecutionStrategyIdentity,
+} from "./execution-journal.ts";
 import {
 	previewAssurance,
 	TaskRunController,
+	TaskRunError,
 	type TaskRunAssurance,
-	type TaskRunEvidence,
+	type TaskRunEvidenceInput,
+	type TaskRunEvent,
 	type TaskRunManifest,
 	type TaskRunState,
 	type TaskRunUpdate,
@@ -152,6 +163,16 @@ import {
 	createOpenAICompatibleProvider,
 	type OpenAICompatibleProviderConfig,
 } from "./openai-compatible-provider.ts";
+import {
+	type CanonicalTrajectoryRecordV1,
+	TrajectoryCompiler,
+} from "./trajectory-compiler.ts";
+import {
+	type EvaluationReport,
+	type RubricDefinition,
+	type RubricFreezeInput,
+	TrajectoryEvaluator,
+} from "./trajectory-evaluator.ts";
 
 export type LogosAgentEvent =
 	| AgentHarnessEvent
@@ -184,22 +205,18 @@ export type LogosAgentUiEvent =
 			outcome: UserQuestionResolution["kind"] | "cancel";
 	  };
 type LogosHarness = AgentHarness<Skill, PromptTemplate, LogosTool>;
-type TaskRunEvidenceInput = Omit<TaskRunEvidence, "id" | "recordedAt">;
-interface PendingTaskRunEvidence {
-	controller: TaskRunController;
-	evidence: TaskRunEvidenceInput;
-	idempotencyKey?: string;
-}
 interface LogosRuntime {
 	harness: LogosHarness;
 	toolSystem: ToolSystem<LogosTool, LogosApprovalSubject>;
 	taskDeliberation: TaskDeliberationController;
 	cacheTracker: CacheObservationTracker;
 	taskRuns: TaskRunController;
+	executions: ExecutionController;
 	codeGraph: CodeGraphWorkspaceManager;
 	codeGraphSync: CodeGraphSyncCoordinator;
 	codeIntelligenceProvider: CodeIntelligenceProvider;
 	createTaskRunManifest(): TaskRunManifest;
+	createExecutionStrategy(): ExecutionStrategyIdentity;
 }
 
 async function loadSystemPromptBase(
@@ -211,6 +228,45 @@ async function loadSystemPromptBase(
 		console.warn(`Logos Agent: ${workspaceInstructions.warning}`);
 	}
 	return buildBaseSystemPrompt(codeAgentSystemPrompt, workspaceInstructions.content);
+}
+
+const TRAJECTORY_DIGEST_KEY_FILE = ".trajectory-hmac-key";
+
+function errorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error
+		? String(error.code)
+		: undefined;
+}
+
+function decodeTrajectoryDigestKey(encoded: string): Uint8Array {
+	const key = Buffer.from(encoded.trim(), "base64url");
+	if (key.byteLength !== 32) {
+		throw new Error("Logos Agent trajectory digest key is invalid");
+	}
+	return new Uint8Array(key);
+}
+
+async function loadOrCreateTrajectoryDigestKey(
+	sessionsRoot: string,
+): Promise<Uint8Array> {
+	const path = join(sessionsRoot, TRAJECTORY_DIGEST_KEY_FILE);
+	try {
+		return decodeTrajectoryDigestKey(await readFile(path, "utf8"));
+	} catch (error) {
+		if (errorCode(error) !== "ENOENT") throw error;
+	}
+	const encoded = randomBytes(32).toString("base64url");
+	try {
+		await writeFile(path, `${encoded}\n`, {
+			encoding: "utf8",
+			flag: "wx",
+			mode: 0o600,
+		});
+		return decodeTrajectoryDigestKey(encoded);
+	} catch (error) {
+		if (errorCode(error) !== "EEXIST") throw error;
+		return decodeTrajectoryDigestKey(await readFile(path, "utf8"));
+	}
 }
 
 export interface LogosAgentSessionInfo {
@@ -272,6 +328,12 @@ export interface LogosAgent {
 		currentRelease?: string,
 	): Promise<CacheReleaseComparison>;
 	getCacheRelease(): string;
+	getActiveExecutionId(): string | undefined;
+	getExecution(id: string): Promise<ExecutionState>;
+	listExecutions(): Promise<ExecutionState[]>;
+	getExecutionTrajectory(id: string): Promise<CanonicalTrajectoryRecordV1>;
+	freezeRubric(input: RubricFreezeInput): RubricDefinition;
+	evaluateExecution(id: string, rubric: RubricDefinition): Promise<EvaluationReport>;
 	getActiveTaskRunId(): string | undefined;
 	getTaskRun(id: string): Promise<TaskRunState>;
 	listTaskRuns(): Promise<TaskRunState[]>;
@@ -415,13 +477,17 @@ export class HarnessLogosAgent implements LogosAgent {
 	private taskDeliberation: TaskDeliberationController;
 	private cacheTracker: CacheObservationTracker;
 	private taskRuns: TaskRunController;
+	private executions: ExecutionController;
+	private readonly trajectoryCompiler: TrajectoryCompiler;
+	private readonly trajectoryEvaluator: TrajectoryEvaluator;
 	private codeGraph: CodeGraphWorkspaceManager;
 	private codeGraphSync: CodeGraphSyncCoordinator;
 	private codeIntelligenceProvider: CodeIntelligenceProvider;
 	private createTaskRunManifest: () => TaskRunManifest;
+	private createExecutionStrategy: () => ExecutionStrategyIdentity;
+	private activeExecutionId?: string;
 	private activeTaskRunId?: string;
 	private readonly turnTaskLifecycle = new TurnTaskLifecycle();
-	private pendingTaskRunEvidence: PendingTaskRunEvidence[] = [];
 	private taskPromotionPromise?: Promise<TaskRunState>;
 	private abortRequestedTaskRunId?: string;
 	private taskAbortController?: AbortController;
@@ -444,6 +510,7 @@ export class HarnessLogosAgent implements LogosAgent {
 		model: Model<any>,
 		session: Session<JsonlSessionMetadata>,
 		systemPromptBase: string,
+		trajectoryDigestKey: Uint8Array,
 	) {
 		this.config = config;
 		this.env = env;
@@ -451,6 +518,12 @@ export class HarnessLogosAgent implements LogosAgent {
 		this.models = models;
 		this.model = model;
 		this.session = session;
+		this.trajectoryCompiler = new TrajectoryCompiler({
+			digestKey: trajectoryDigestKey,
+		});
+		this.trajectoryEvaluator = new TrajectoryEvaluator({
+			digestKey: trajectoryDigestKey,
+		});
 		this.observability = createLogosAgentObservability(undefined, config.workspaceRoot);
 		this.commandManager = createNodeControlledCommandManager(
 			config.workspaceRoot,
@@ -462,10 +535,12 @@ export class HarnessLogosAgent implements LogosAgent {
 		this.taskDeliberation = runtime.taskDeliberation;
 		this.cacheTracker = runtime.cacheTracker;
 		this.taskRuns = runtime.taskRuns;
+		this.executions = runtime.executions;
 		this.codeGraph = runtime.codeGraph;
 		this.codeGraphSync = runtime.codeGraphSync;
 		this.codeIntelligenceProvider = runtime.codeIntelligenceProvider;
 		this.createTaskRunManifest = runtime.createTaskRunManifest;
+		this.createExecutionStrategy = runtime.createExecutionStrategy;
 	}
 
 	static async create(config: LogosAgentConfig): Promise<HarnessLogosAgent> {
@@ -477,6 +552,9 @@ export class HarnessLogosAgent implements LogosAgent {
 		const sessions = await repo.list({ cwd: config.workspaceRoot });
 		const session = sessions[0] ? await repo.open(sessions[0]) : await repo.create({ cwd: config.workspaceRoot });
 		const systemPromptBase = await loadSystemPromptBase(env, config.workspaceRoot);
+		const trajectoryDigestKey = await loadOrCreateTrajectoryDigestKey(
+			config.sessionsRoot,
+		);
 		const agent = new HarnessLogosAgent(
 			config,
 			env,
@@ -485,10 +563,12 @@ export class HarnessLogosAgent implements LogosAgent {
 			model,
 			session,
 			systemPromptBase,
+			trajectoryDigestKey,
 		);
 		try {
 			agent.enableObservability();
 			await agent.hydrateCacheTracker();
+			await agent.reconcileExecutions(true);
 			agent.attachHarness();
 			return agent;
 		} catch (error) {
@@ -523,6 +603,9 @@ export class HarnessLogosAgent implements LogosAgent {
 	): LogosRuntime {
 		const taskRuns = new TaskRunController({
 			journal: new SessionTaskRunJournal(session),
+		});
+		const executions = new ExecutionController({
+			journal: new SessionExecutionJournal(session),
 		});
 		const readOperations = createNodeReadOnlyWorkspaceOperations(this.config.workspaceRoot);
 		const codeGraphRunner = createNodeCodeGraphCommandRunner(
@@ -702,6 +785,17 @@ export class HarnessLogosAgent implements LogosAgent {
 				this.config.thinkingLevel,
 			),
 		});
+		const createExecutionStrategy = (): ExecutionStrategyIdentity => ({
+			version: this.config.cacheEnvironment.release,
+			manifest: createTaskRunManifest(),
+			thinkingLevel: harness.getThinkingLevel(),
+			streamOptionsHash: cacheStructureHash(harness.getStreamOptions()),
+			contextPolicyHash: cacheStructureHash({
+				version: "context-manager-v1",
+				compactableToolNames: toolSystem.getCompactableToolNames(),
+				compactAfterUseToolNames: toolSystem.getCompactAfterUseToolNames(),
+			}),
+		});
 		harness.on("context", async (event) => {
 			const snapshot = contextManager.prepare(event.messages);
 			await this.emit({
@@ -788,16 +882,29 @@ export class HarnessLogosAgent implements LogosAgent {
 			taskDeliberation,
 			cacheTracker,
 			taskRuns,
+			executions,
 			codeGraph,
 			codeGraphSync,
 			codeIntelligenceProvider,
 			createTaskRunManifest,
+			createExecutionStrategy,
 		};
 	}
 
 	private attachHarness(): void {
 		this.unsubscribeHarness();
 		this.unsubscribeHarness = this.harness.subscribe(async (event) => {
+			if (event.type === "message_end") {
+				const role: ExecutionMessageRole | undefined =
+					event.message.role === "user"
+						? "user"
+						: event.message.role === "assistant"
+							? "assistant"
+							: event.message.role === "toolResult"
+								? "tool_result"
+								: undefined;
+				if (role !== undefined) await this.linkCurrentSessionMessage(role);
+			}
 			if (event.type === "message_start" && event.message.role === "user") {
 				const text = getMessageText(event.message);
 				if (
@@ -864,10 +971,118 @@ export class HarnessLogosAgent implements LogosAgent {
 		});
 	}
 
+	private async linkCurrentSessionMessage(
+		role: ExecutionMessageRole,
+	): Promise<void> {
+		const executionId = this.activeExecutionId;
+		if (executionId === undefined) return;
+		const entryId = await this.session.getLeafId();
+		if (entryId === null) {
+			throw new Error("Persisted message is missing from the active Session branch");
+		}
+		const entry = await this.session.getEntry(entryId);
+		const expectedRole = role === "tool_result" ? "toolResult" : role;
+		if (entry?.type !== "message" || entry.message.role !== expectedRole) {
+			throw new Error(
+				`Session leaf ${entryId} does not match persisted ${role} message`,
+			);
+		}
+		await this.executions.apply(
+			executionId,
+			{ type: "link_session_entry", entryId, role },
+			{ idempotencyKey: `session-entry:${entryId}` },
+		);
+	}
+
 	private async hydrateCacheTracker(): Promise<void> {
 		this.cacheTracker.hydrate(
 			collectCacheObservations(await this.session.getEntries()),
 		);
+	}
+
+	private async replayExecutionFacts(
+		controller: TaskRunController,
+		run: TaskRunState,
+		execution: ExecutionState,
+		emitUpdates = false,
+	): Promise<TaskRunState> {
+		let current = run;
+		if (current.status === "terminal") return current;
+		for (const fact of execution.facts) {
+			const { id: _id, recordedAt: _recordedAt, ...evidence } = fact.evidence;
+			const update = { type: "evidence", evidence } as const;
+			const options = { idempotencyKey: `execution-fact:${fact.eventId}` };
+			current = emitUpdates
+				? await this.applyTaskRunUpdate(controller, current.id, update, options)
+				: await controller.apply(current.id, update, options);
+		}
+		return current;
+	}
+
+	private async reconcileExecution(
+		executionId: string,
+		recoverInterrupted = false,
+	): Promise<ExecutionState> {
+		let execution = await this.executions.get(executionId);
+		const candidates = (await this.taskRuns.list()).filter(
+			(run) => run.executionId === executionId,
+		);
+		if (execution.runId === undefined) {
+			if (candidates.length > 1) {
+				throw new Error(
+					`Execution ${executionId} has multiple unlinked TaskRuns: ${candidates.map((run) => run.id).join(", ")}`,
+				);
+			}
+			const candidate = candidates[0];
+			if (candidate !== undefined) {
+				execution = await this.executions.apply(
+					executionId,
+					{ type: "link_task_run", runId: candidate.id },
+					{ idempotencyKey: `task-run:${candidate.id}` },
+				);
+			}
+		}
+		const linkedRunId = execution.runId;
+		const linkedRun =
+			linkedRunId === undefined
+				? undefined
+				: candidates.find((run) => run.id === linkedRunId);
+		if (linkedRun !== undefined && candidates.some((run) => run.id !== linkedRunId)) {
+			throw new Error(
+				`Execution ${executionId} links ${linkedRunId} but also owns another TaskRun`,
+			);
+		}
+		if (linkedRun !== undefined) {
+			await this.replayExecutionFacts(this.taskRuns, linkedRun, execution);
+			if (recoverInterrupted && linkedRun.status !== "terminal") {
+				await this.taskRuns.apply(
+					linkedRun.id,
+					{
+						type: "finish",
+						conclusion: "aborted",
+						reason: "Recovered after the previous process ended before completion",
+					},
+					{ idempotencyKey: `recovery:${executionId}` },
+				);
+			}
+		}
+		if (recoverInterrupted && execution.status === "active") {
+			const lastEntryId =
+				execution.entryLinks[execution.entryLinks.length - 1]?.entryId ??
+				execution.branchParentEntryId;
+			execution = await this.executions.apply(
+				executionId,
+				{ type: "finish", outcome: "aborted", lastEntryId },
+				{ idempotencyKey: `recovery:${executionId}` },
+			);
+		}
+		return execution;
+	}
+
+	private async reconcileExecutions(recoverInterrupted = false): Promise<void> {
+		for (const execution of await this.executions.list()) {
+			await this.reconcileExecution(execution.id, recoverInterrupted);
+		}
 	}
 
 	private async promoteActiveTurnToTask(
@@ -878,34 +1093,29 @@ export class HarnessLogosAgent implements LogosAgent {
 		}
 		if (this.taskPromotionPromise) return await this.taskPromotionPromise;
 		const goal = this.turnTaskLifecycle.getGoal();
-		if (!goal || !this.turnTaskLifecycle.isTask()) {
+		const executionId = this.activeExecutionId;
+		if (!goal || !this.turnTaskLifecycle.isTask() || executionId === undefined) {
 			throw new Error("No active execution task is available for promotion");
 		}
 		const promotion = (async () => {
 			const session = await this.session.getMetadata();
 			const run = await controller.start({
+				executionId,
 				sessionId: session.id,
 				goal,
 				manifest: this.createTaskRunManifest(),
+				idempotencyKey: `execution:${executionId}`,
 			});
 			this.activeTaskRunId = run.id;
+			await this.executions.apply(
+				executionId,
+				{ type: "link_task_run", runId: run.id },
+				{ idempotencyKey: `task-run:${run.id}` },
+			);
+			this.observability.linkTaskRun(run.id);
 			await this.emit({ type: "task_run_update", run });
-			const buffered = this.pendingTaskRunEvidence;
-			this.pendingTaskRunEvidence = [];
-			for (const pending of buffered) {
-				if (pending.controller !== controller) continue;
-				await this.recordTaskRunEvidence(
-					controller,
-					pending.evidence,
-					{
-						runId: run.id,
-						...(pending.idempotencyKey === undefined
-							? {}
-							: { idempotencyKey: pending.idempotencyKey }),
-					},
-				);
-			}
-			return await controller.get(run.id);
+			const execution = await this.executions.get(executionId);
+			return await this.replayExecutionFacts(controller, run, execution, true);
 		})();
 		this.taskPromotionPromise = promotion;
 		try {
@@ -933,21 +1143,29 @@ export class HarnessLogosAgent implements LogosAgent {
 		evidence: TaskRunEvidenceInput,
 		options: { runId?: string; idempotencyKey?: string } = {},
 	): Promise<TaskRunState | undefined> {
-		const runId = options.runId ?? this.activeTaskRunId;
-		if (runId === undefined) {
-			if (this.turnTaskLifecycle.getGoal() !== undefined) {
-				this.pendingTaskRunEvidence.push({
-					controller,
-					evidence: structuredClone(evidence),
-					...(options.idempotencyKey === undefined
-						? {}
-						: { idempotencyKey: options.idempotencyKey }),
-				});
-			}
-			return undefined;
+		const executionId = this.activeExecutionId;
+		let execution: ExecutionState | undefined;
+		if (executionId !== undefined) {
+			execution = await this.executions.apply(
+				executionId,
+				{ type: "fact", evidence },
+				options.idempotencyKey === undefined
+					? {}
+					: { idempotencyKey: `fact:${options.idempotencyKey}` },
+			);
 		}
+		const runId = options.runId ?? this.activeTaskRunId;
+		if (runId === undefined) return undefined;
 		const current = await controller.get(runId);
 		if (current.status === "terminal") return current;
+		if (execution !== undefined) {
+			return await this.replayExecutionFacts(
+				controller,
+				current,
+				execution,
+				true,
+			);
+		}
 		return await this.applyTaskRunUpdate(
 			controller,
 			runId,
@@ -1322,14 +1540,19 @@ export class HarnessLogosAgent implements LogosAgent {
 
 	async prompt(text: string): Promise<AssistantMessage> {
 		if (this.isBusy()) throw new Error("Logos Agent is busy");
+		const executionId = randomUUID();
 		const result = await this.observability.runTurn(
 			text,
-			async () => await this.executePrompt(text),
+			async () => await this.executePrompt(text, executionId),
+			{ executionId },
 		);
 		return result.message;
 	}
 
-	private async executePrompt(text: string): Promise<LogosAgentTurnResult> {
+	private async executePrompt(
+		text: string,
+		executionId: string,
+	): Promise<LogosAgentTurnResult> {
 		let finishPromptLifecycle = () => {};
 		const promptLifecyclePromise = new Promise<void>((resolve) => {
 			finishPromptLifecycle = resolve;
@@ -1340,10 +1563,22 @@ export class HarnessLogosAgent implements LogosAgent {
 		this.taskDeliberation.beginTurn();
 		this.codeIntelligenceProvider.beginTurn();
 		this.turnTaskLifecycle.beginTurn(text);
-		this.pendingTaskRunEvidence = [];
+		this.activeExecutionId = executionId;
 		const taskAbortController = new AbortController();
 		this.taskAbortController = taskAbortController;
+		let executionStarted = false;
+		let executionOutcome: ExecutionOutcome = "failed";
+		let promptFailure: unknown;
 		try {
+			const session = await this.session.getMetadata();
+			await this.executions.start({
+				executionId,
+				sessionId: session.id,
+				branchParentEntryId: await this.session.getLeafId(),
+				strategy: this.createExecutionStrategy(),
+				idempotencyKey: `start:${executionId}`,
+			});
+			executionStarted = true;
 			const completion = await runTaskCompletionLoop(
 				text,
 				async (prompt) => await this.harness.prompt(prompt),
@@ -1373,6 +1608,12 @@ export class HarnessLogosAgent implements LogosAgent {
 					: completed
 						? "ok"
 						: "error";
+			executionOutcome =
+				outcome === "ok"
+					? "completed"
+					: outcome === "aborted"
+						? "aborted"
+						: "failed";
 			const runId = this.activeTaskRunId;
 			if (runId !== undefined) {
 				await this.applyTaskRunUpdate(
@@ -1425,6 +1666,10 @@ export class HarnessLogosAgent implements LogosAgent {
 			}
 			return { message, outcome };
 		} catch (error) {
+			promptFailure = error;
+			executionOutcome = taskAbortController.signal.aborted
+				? "aborted"
+				: "failed";
 			const runId = this.activeTaskRunId;
 			if (runId !== undefined) {
 				const run = await this.taskRuns.get(runId);
@@ -1442,6 +1687,24 @@ export class HarnessLogosAgent implements LogosAgent {
 			}
 			throw error;
 		} finally {
+			let executionFinalizationError: unknown;
+			if (executionStarted) {
+				try {
+					const lastEntryId = await this.session.getLeafId();
+					if (lastEntryId === null) {
+						throw new Error(
+							`Execution ${executionId} has no persisted Session leaf`,
+						);
+					}
+					await this.executions.apply(
+						executionId,
+						{ type: "finish", outcome: executionOutcome, lastEntryId },
+						{ idempotencyKey: `finish:${executionId}` },
+					);
+				} catch (error) {
+					executionFinalizationError = error;
+				}
+			}
 			const finishingRunId = this.activeTaskRunId;
 			this.taskCompletion.reset();
 			if (this.taskAbortController === taskAbortController) {
@@ -1451,13 +1714,29 @@ export class HarnessLogosAgent implements LogosAgent {
 				this.abortRequestedTaskRunId = undefined;
 			}
 			this.activeTaskRunId = undefined;
-			this.pendingTaskRunEvidence = [];
+			this.activeExecutionId = undefined;
 			this.turnTaskLifecycle.endTurn();
 			this.busy = false;
 			if (this.promptLifecyclePromise === promptLifecyclePromise) {
 				this.promptLifecyclePromise = undefined;
 			}
 			finishPromptLifecycle();
+			if (executionFinalizationError !== undefined) {
+				if (promptFailure !== undefined) {
+					throw new AggregateError(
+						[
+							promptFailure instanceof Error
+								? promptFailure
+								: new Error(String(promptFailure)),
+							executionFinalizationError instanceof Error
+								? executionFinalizationError
+								: new Error(String(executionFinalizationError)),
+						],
+						`Execution ${executionId} failed and could not be finalized`,
+					);
+				}
+				throw executionFinalizationError;
+			}
 		}
 	}
 
@@ -1545,6 +1824,58 @@ export class HarnessLogosAgent implements LogosAgent {
 
 	isBusy(): boolean {
 		return this.busy || this.transitioning;
+	}
+
+	getActiveExecutionId(): string | undefined {
+		return this.activeExecutionId;
+	}
+
+	async getExecution(id: string): Promise<ExecutionState> {
+		return await this.reconcileExecution(id);
+	}
+
+	async listExecutions(): Promise<ExecutionState[]> {
+		await this.reconcileExecutions();
+		return await this.executions.list();
+	}
+
+	async getExecutionTrajectory(
+		id: string,
+	): Promise<CanonicalTrajectoryRecordV1> {
+		const execution = await this.reconcileExecution(id);
+		let taskRun: TaskRunState | undefined;
+		let taskRunEvents: readonly TaskRunEvent[] | undefined;
+		if (execution.runId !== undefined) {
+			try {
+				taskRun = await this.taskRuns.get(execution.runId);
+				taskRunEvents = await this.taskRuns.getEvents(execution.runId);
+			} catch (error) {
+				if (!(error instanceof TaskRunError) || error.code !== "not_found") {
+					throw error;
+				}
+			}
+		}
+		return this.trajectoryCompiler.compile({
+			execution,
+			executionEvents: await this.executions.getEvents(id),
+			sessionEntries: await this.session.getEntries(),
+			...(taskRun === undefined ? {} : { taskRun }),
+			...(taskRunEvents === undefined ? {} : { taskRunEvents }),
+		});
+	}
+
+	freezeRubric(input: RubricFreezeInput): RubricDefinition {
+		return this.trajectoryEvaluator.freeze(input);
+	}
+
+	async evaluateExecution(
+		id: string,
+		rubric: RubricDefinition,
+	): Promise<EvaluationReport> {
+		return this.trajectoryEvaluator.evaluate(
+			rubric,
+			await this.getExecutionTrajectory(id),
+		);
 	}
 
 	getActiveTaskRunId(): string | undefined {
@@ -1832,12 +2163,15 @@ export class HarnessLogosAgent implements LogosAgent {
 		this.taskDeliberation = runtime.taskDeliberation;
 		this.cacheTracker = runtime.cacheTracker;
 		this.taskRuns = runtime.taskRuns;
+		this.executions = runtime.executions;
 		this.codeGraph = runtime.codeGraph;
 		this.codeGraphSync = runtime.codeGraphSync;
 		this.codeIntelligenceProvider = runtime.codeIntelligenceProvider;
 		this.createTaskRunManifest = runtime.createTaskRunManifest;
+		this.createExecutionStrategy = runtime.createExecutionStrategy;
 		this.uninstrumentHarness = this.observability.instrument(this.harness);
 		await this.hydrateCacheTracker();
+		await this.reconcileExecutions(true);
 		this.attachHarness();
 	}
 

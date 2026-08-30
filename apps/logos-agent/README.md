@@ -32,6 +32,15 @@ TUI -> LogosAgent -> AgentHarness -> Agent loop -> Provider
 - `beforeToolCall` 产生审计事件，`afterToolCall` 对结果脱敏。
 - 不提供 shell 字符串、管道、重定向、环境覆盖或任意可执行文件；项目命令使用结构化参数和 `shell: false`。
 
+Execution 与规范轨迹：
+
+- 每次 prompt 在首个 Provider 请求前持久化一个 `execution_event` journal；纯对话、read-only turn 和 promotion 前失败也有稳定 `executionId`。
+- Provider、工具、审批、变更、验证和 assistant 事实先写入 ExecutionJournal。触发副作用能力后，TaskRun v2 关联同一 `executionId` 并重放 promotion 前事实，不依赖进程内 evidence buffer；启动和 Session 切换会幂等恢复中断的关联与 replay。旧 TaskRun v1 以显式 legacy identity 继续可读。
+- `getExecution()`、`listExecutions()` 和 `getExecutionTrajectory()` 提供程序化查询。当前 trajectory 是 observe-only 的 `private-v1` 投影，不执行 rubric、完成门禁或在线控制。
+- `freezeRubric()` 在 execution 前冻结并签名确定性 rubric；`evaluateExecution()` 按需生成证据引用的 private evaluation report，分别报告 completed、semantically correct 和 verified。当前 compiler 对 mutation coverage 保守输出 `unknown`，因此 current-subject verification 不会在覆盖未被完整证明时硬通过；评价结果不改变 Agent 行为。
+- Canonical compiler 合并 Execution、Session 和原始 TaskRun 事件，检测重复 ID 冲突并去除 promotion replay 镜像；只输出引用和本地 HMAC digest，不复制 Prompt、工具全文或 reasoning。持久 key 位于 Session 根目录的 `.trajectory-hmac-key`，不进入模型上下文或 OTel。
+- Phoenix turn、Provider 和 tool spans 使用 `logos_agent.execution_id` 关联；promotion 后同时写入 `logos_agent.run_id`。telemetry 不参与 canonical trajectory digest。
+
 Git 读取边界：
 
 - Git 命令通过注入的 operations 适配器执行，不读取全局 CWD，也不使用 shell。

@@ -106,13 +106,21 @@ function createFaultInjectingProvider(options: {
 } = {}): {
 	provider: NodeTracerProvider;
 	statuses: RecordedStatus[];
+	attributes: Record<string, unknown>;
 	shutdownCalls(): number;
 } {
 	const statuses: RecordedStatus[] = [];
+	const attributes: Record<string, unknown> = {};
 	let shutdownCount = 0;
 	const span = {
-		setAttribute: () => span,
-		setAttributes: () => span,
+		setAttribute: (key: string, value: unknown) => {
+			attributes[key] = value;
+			return span;
+		},
+		setAttributes: (values: Record<string, unknown>) => {
+			Object.assign(attributes, values);
+			return span;
+		},
 		setStatus: (status: RecordedStatus) => {
 			statuses.push(status);
 			return span;
@@ -121,12 +129,22 @@ function createFaultInjectingProvider(options: {
 		end: () => {},
 	};
 	const tracer = {
-		startSpan: () => span,
+		startSpan: (_name: string, spanOptions?: unknown) => {
+			const optionsRecord = spanOptions as {
+				attributes?: Record<string, unknown>;
+			};
+			Object.assign(attributes, optionsRecord.attributes ?? {});
+			return span;
+		},
 		startActiveSpan: (
 			_name: string,
-			_options: unknown,
+			spanOptions: unknown,
 			callback: (activeSpan: typeof span) => Promise<LogosAgentTurnResult>,
 		) => {
+			const optionsRecord = spanOptions as {
+				attributes?: Record<string, unknown>;
+			};
+			Object.assign(attributes, optionsRecord.attributes ?? {});
 			const result = callback(span);
 			if (options.throwAfterCallback) throw new Error("telemetry invocation failed");
 			return result;
@@ -144,8 +162,29 @@ function createFaultInjectingProvider(options: {
 			shutdownCount += 1;
 		},
 	} as unknown as NodeTracerProvider;
-	return { provider, statuses, shutdownCalls: () => shutdownCount };
+	return { provider, statuses, attributes, shutdownCalls: () => shutdownCount };
 }
+
+test("observability adds a durable TaskRun correlation after promotion", async () => {
+	const fake = createFaultInjectingProvider();
+	const observability = createLogosAgentObservability(
+		{ endpoint: "http://collector.invalid" },
+		workspaceRoot,
+		() => fake.provider,
+	);
+	await observability.runTurn(
+		"hello",
+		async () => {
+			observability.linkTaskRun("run-1");
+			return { message: assistantMessage("ok"), outcome: "ok" };
+		},
+		{ executionId: "execution-1" },
+	);
+
+	assert.equal(fake.attributes["logos_agent.execution_id"], "execution-1");
+	assert.equal(fake.attributes["logos_agent.run_id"], "run-1");
+	await observability.shutdown();
+});
 
 test("enabled observability does not repeat or reject a turn when tracer invocation fails", async () => {
 	const fake = createFaultInjectingProvider({ throwAfterCallback: true });

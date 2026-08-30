@@ -5,7 +5,6 @@ import type {
 } from "../../../packages/agent/src/index.ts";
 import {
 	decodeTaskRunEvent,
-	TASK_RUN_EVENT_VERSION,
 	type TaskRunEvent,
 	type TaskRunJournal,
 } from "./task-run.ts";
@@ -34,12 +33,7 @@ export class SessionTaskRunJournal<
 			) {
 				continue;
 			}
-			if (
-				typeof entry.data !== "object" ||
-				entry.data === null ||
-				!("version" in entry.data) ||
-				entry.data.version !== TASK_RUN_EVENT_VERSION
-			) {
+			if (typeof entry.data !== "object" || entry.data === null) {
 				throw new Error(`Unsupported TaskRun event in Session entry ${entry.id}`);
 			}
 			events.push(decodeTaskRunEvent(entry.data));

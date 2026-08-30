@@ -4,15 +4,17 @@
 
 ## TaskRun
 
-每次 `LearningAgent.prompt()` 创建一个 TaskRun，并冻结当时的 Manifest：
+每次 `LearningAgent.prompt()` 先开始一个普通 turn。只有模型请求 `edit.propose`、`fs.write`、`fs.delete`、`process.execute` 或 `process.terminate` 这类任务能力时，turn 才 promotion 为 TaskRun，并冻结当时的 Manifest。纯对话和 read-only turn 不创建 TaskRun：
 
 - release、应用版本、commit 和 feature flags
 - 模型、system prompt、工具定义和权限策略的 hash
 - workspace 身份和执行预算
 
+因此 TaskRun 不是每次 prompt 的统一关联身份。prompt 级持久关联、pre-promotion 事实和 read-only execution 由 [元认知控制与演进设计](./metacognitive-control-and-evolution.md) 中已经落地的 `ExecutionJournal` 承担。
+
 运行状态包含 `discover -> execute -> verify -> deliver` 阶段，以及 `active`、`waiting`、`terminal` 生命周期。审批期间进入 `waiting`，审批结束后恢复。Provider 请求、工具决策/结果、审批、受控变更、验证命令、缓存观测和最终回复均记录为证据。
 
-TaskRun 使用追加事件存储在当前 Session 的 `task_run_event` custom entries 中。事件可重放恢复状态，但普通 custom entry 不会被 `Session.buildContext()` 投影成模型消息，因此不会增加模型上下文。
+TaskRun 使用 v2 追加事件存储在当前 Session 的 `task_run_event` custom entries 中。start event 必须携带 prompt 级 `executionId`；ExecutionJournal 同时追加 `task_run_linked`，使 promotion 前后事实属于同一 execution。启动和切换 Session 时会对两本 journal 做幂等 reconciliation：恢复已创建但未关联的 TaskRun，补写中断的 evidence replay，并把上个进程遗留的 active execution/TaskRun 审计为 `aborted`；普通查询只修复关联，不会终止当前进程中的 active execution。旧 v1 start event 仍可读取，并显式映射为 `legacy-task-run:<runId>`，不会伪造不存在的 prompt execution。普通 custom entry 不会被 `Session.buildContext()` 投影成模型消息，因此不会增加模型上下文。
 
 TUI 提供：
 
@@ -43,3 +45,5 @@ TUI 提供：
 - efficiency：耗时、Provider 请求数和工具调用数是否超预算
 
 同一 suite 的两份报告可以按 case 对比 improved、regressed、unchanged，并汇总通过率和 verified rate 的变化。workspace fixture 的准备和真实 Agent 执行由调用方 Adapter 提供，TaskRun/Eval 核心不依赖具体测试环境。
+
+P1 在此基础上增加 `TrajectoryEvaluator`：旧 `TaskEvalCase` 可转换成执行前冻结的 rubric，评价只读取 private canonical trajectory。hard criterion 的 pass/fail 必须引用 `evidenceIndex`；轨迹不完整、负向判据缺少完整 coverage、当前 workspace fingerprint 不可证或 evaluator 未启用时返回 unknown。当前 compiler 尚未产生完整 mutation coverage attestation，因此即使观察到匹配当前 fingerprint 的验证，也会保守返回 unknown，不能硬通过。生产 hard failure 可以生成携带 rubric、失败 criterion 和 evidence refs 的 regression case seed，但 workspace fixture 仍由调用方显式提供。

@@ -52,11 +52,13 @@ function createController(
 test("TaskRun records a verified execution from immutable evidence", async () => {
 	const { controller } = createController();
 	const started = await controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Fix cache accounting",
 		manifest,
 	});
 	assert.equal(started.status, "active");
+	assert.equal(started.executionId, "execution-1");
 	assert.equal(started.phase, "discover");
 
 	await controller.apply(started.id, { type: "phase", phase: "execute" });
@@ -117,6 +119,7 @@ test("TaskRun records a verified execution from immutable evidence", async () =>
 test("a later change invalidates earlier verification", async () => {
 	const { controller } = createController();
 	const run = await controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Update implementation",
 		manifest,
@@ -161,6 +164,7 @@ test("a later change invalidates earlier verification", async () => {
 test("a later failed verification invalidates an earlier pass", async () => {
 	const { controller } = createController();
 	const run = await controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Verify the workspace",
 		manifest,
@@ -194,6 +198,7 @@ test("a later failed verification invalidates an earlier pass", async () => {
 test("previewAssurance reports what a success finish would record", async () => {
 	const { controller } = createController();
 	const run = await controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Preview the assurance",
 		manifest,
@@ -229,6 +234,7 @@ test("previewAssurance reports what a success finish would record", async () => 
 test("TaskRun attributes successful network queries", async () => {
 	const { controller } = createController();
 	const run = await controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Find current release information",
 		manifest,
@@ -250,6 +256,7 @@ test("TaskRun attributes successful network queries", async () => {
 test("TaskRun enforces waiting and terminal transition invariants", async () => {
 	const { controller } = createController();
 	const run = await controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Apply an approved edit",
 		manifest,
@@ -299,6 +306,7 @@ test("TaskRun enforces waiting and terminal transition invariants", async () => 
 test("TaskRun idempotency survives controller recreation", async () => {
 	const first = createController();
 	const run = await first.controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Inspect the workspace",
 		manifest,
@@ -319,6 +327,7 @@ test("TaskRun idempotency survives controller recreation", async () => {
 
 	const second = createController(first.journal, Date.parse("2026-07-30T01:00:00.000Z"));
 	const duplicateRun = await second.controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Inspect the workspace",
 		manifest,
@@ -342,6 +351,45 @@ test("TaskRun idempotency survives controller recreation", async () => {
 	assert.equal(duplicateEvidence.sequence, 2);
 });
 
+test("TaskRun rejects an idempotency key reused with a different update", async () => {
+	const { controller } = createController();
+	const run = await controller.start({
+		executionId: "execution-1",
+		sessionId: "session-1",
+		goal: "Reject conflicting replay",
+		manifest,
+	});
+	await controller.apply(
+		run.id,
+		{
+			type: "evidence",
+			evidence: {
+				kind: "verification",
+				sourceId: "verification-1",
+				outcome: "passed",
+			},
+		},
+		{ idempotencyKey: "verification-1" },
+	);
+
+	await assert.rejects(
+		controller.apply(
+			run.id,
+			{
+				type: "evidence",
+				evidence: {
+					kind: "verification",
+					sourceId: "verification-1",
+					outcome: "failed",
+				},
+			},
+			{ idempotencyKey: "verification-1" },
+		),
+		(error: unknown) =>
+			error instanceof TaskRunError && error.code === "invalid_event",
+	);
+});
+
 test("Session TaskRun journal persists events outside model context", async () => {
 	const storage = new InMemorySessionStorage({
 		metadata: {
@@ -359,6 +407,7 @@ test("Session TaskRun journal persists events outside model context", async () =
 	});
 
 	const run = await controller.start({
+		executionId: "execution-1",
 		sessionId: "session-1",
 		goal: "Persist task evidence",
 		manifest,
@@ -378,4 +427,47 @@ test("Session TaskRun journal persists events outside model context", async () =
 	);
 	assert.deepEqual((await session.buildContext()).messages, []);
 	assert.equal((await controller.get(run.id)).status, "terminal");
+});
+
+test("Session TaskRun journal migrates persisted v1 events with a legacy execution identity", async () => {
+	const storage = new InMemorySessionStorage({
+		metadata: {
+			id: "session-1",
+			createdAt: "2026-07-30T00:00:00.000Z",
+		},
+	});
+	const session = new Session(storage);
+	await session.appendCustomEntry(TASK_RUN_EVENT_CUSTOM_TYPE, {
+		version: 1,
+		id: "legacy-start",
+		runId: "legacy-run",
+		sequence: 1,
+		timestamp: "2026-07-30T00:00:00.000Z",
+		type: "started",
+		sessionId: "session-1",
+		goal: "Read an old TaskRun",
+		manifest,
+	});
+	await session.appendCustomEntry(TASK_RUN_EVENT_CUSTOM_TYPE, {
+		version: 1,
+		id: "legacy-finish",
+		runId: "legacy-run",
+		sequence: 2,
+		timestamp: "2026-07-30T00:01:00.000Z",
+		type: "finished",
+		conclusion: "success",
+	});
+
+	const controller = new TaskRunController({
+		journal: new SessionTaskRunJournal(session),
+	});
+	const run = await controller.get("legacy-run");
+
+	assert.equal(run.executionId, "legacy-task-run:legacy-run");
+	assert.equal(run.status, "terminal");
+	assert.equal((await controller.list())[0]?.id, "legacy-run");
+	assert.deepEqual(
+		(await controller.getEvents("legacy-run")).map((event) => event.version),
+		[2, 2],
+	);
 });

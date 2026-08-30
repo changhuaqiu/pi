@@ -5,6 +5,13 @@ import type {
 	TaskRunEvidenceKind,
 	TaskRunState,
 } from "./task-run.ts";
+import type {
+	EvaluationReport,
+	RubricDefinition,
+	RubricCriterion,
+	RubricDimension,
+	RubricFreezeInput,
+} from "./trajectory-evaluator.ts";
 
 export type TaskEvalCategory =
 	| "analysis"
@@ -98,11 +105,206 @@ export interface TaskEvalRunOptions {
 	now?: () => Date;
 }
 
+export interface TrajectoryRegressionCase {
+	id: string;
+	category: TaskEvalCategory;
+	goal: string;
+	workspaceFixture: string;
+	baseRevision?: string;
+	budget: TaskRunBudget;
+	rubric: RubricDefinition;
+	sourceFailure: {
+		evaluationId: string;
+		executionId: string;
+		reportDigest: string;
+		failedCriterionIds: readonly string[];
+		evidenceRefs: readonly string[];
+	};
+}
+
+export interface TrajectoryFailureCaseInput {
+	report: EvaluationReport;
+	rubric: RubricDefinition;
+	category: TaskEvalCategory;
+	goal: string;
+	workspaceFixture: string;
+	baseRevision?: string;
+	budget: TaskRunBudget;
+	id?: string;
+}
+
+export function createTrajectoryRegressionCaseFromFailure(
+	input: TrajectoryFailureCaseInput,
+): TrajectoryRegressionCase {
+	if (input.report.hardDecision !== "fail") {
+		throw new Error("Only a hard evaluation failure can seed a regression case");
+	}
+	if (
+		input.report.rubricDigest !== input.rubric.rubricDigest ||
+		input.report.rubricVersion !== input.rubric.version
+	) {
+		throw new Error("Evaluation report and rubric do not match");
+	}
+	if (!isNonEmpty(input.goal) || !isNonEmpty(input.workspaceFixture)) {
+		throw new Error("Regression case requires a goal and workspace fixture");
+	}
+	const failedDiagnostics = input.report.diagnostics.filter(
+		(diagnostic) => diagnostic.code === "hard_gate_failed",
+	);
+	const failedCriterionIds = [
+		...new Set(failedDiagnostics.flatMap((diagnostic) => diagnostic.criterionIds)),
+	].sort();
+	if (failedCriterionIds.length === 0) {
+		throw new Error("Evaluation failure has no failed hard criterion");
+	}
+	return {
+		id: input.id ?? `failure-${input.report.reportDigest.slice(0, 16)}`,
+		category: input.category,
+		goal: input.goal,
+		workspaceFixture: input.workspaceFixture,
+		...(input.baseRevision === undefined
+			? {}
+			: { baseRevision: input.baseRevision }),
+		budget: structuredClone(input.budget),
+		rubric: structuredClone(input.rubric),
+		sourceFailure: {
+			evaluationId: input.report.evaluationId,
+			executionId: input.report.executionId,
+			reportDigest: input.report.reportDigest,
+			failedCriterionIds,
+			evidenceRefs: [
+				...new Set(
+					failedDiagnostics.flatMap((diagnostic) => diagnostic.evidenceRefs),
+				),
+			].sort(),
+		},
+	};
+}
+
 const assuranceRank: Record<TaskRunAssurance, number> = {
 	unverified: 0,
 	partial: 1,
 	verified: 2,
 };
+
+function binaryRubricCriterion(input: {
+	id: string;
+	dimension: RubricDimension;
+	evidencePredicate: RubricCriterion["evidencePredicate"];
+}): RubricCriterion {
+	return {
+		id: input.id,
+		name: input.id,
+		description: `Migrated TaskEval expectation: ${input.id}`,
+		dimension: input.dimension,
+		scope: "task_specific",
+		required: true,
+		decisionRole: "gate",
+		evaluatorKind: "deterministic",
+		scoring: "binary",
+		scoreDomain: [0, 1],
+		anchors: [
+			{ score: 0, description: "expectation failed" },
+			{ score: 1, description: "expectation passed" },
+		],
+		evidencePredicate: input.evidencePredicate,
+	};
+}
+
+export function taskEvalCaseToRubricFreezeInput(
+	evalCase: TaskEvalCase,
+): RubricFreezeInput {
+	validateSuite({ id: `rubric:${evalCase.id}`, cases: [evalCase] });
+	const outcomeByConclusion = {
+		success: "completed",
+		failure: "failed",
+		aborted: "aborted",
+		timed_out: "timed_out",
+	} as const;
+	const criteria: RubricCriterion[] = [
+		binaryRubricCriterion({
+			id: "expected-execution-outcome",
+			dimension: "completion",
+			evidencePredicate: {
+				kind: "execution_completed",
+				allowedOutcomes: [outcomeByConclusion[evalCase.expect.conclusion]],
+			},
+		}),
+	];
+	if (evalCase.expect.minimumAssurance === "verified") {
+		criteria.push(
+			binaryRubricCriterion({
+				id: "current-subject-verified",
+				dimension: "verification",
+				evidencePredicate: { kind: "current_subject_verified" },
+			}),
+		);
+	} else if (evalCase.expect.minimumAssurance === "partial") {
+		criteria.push(
+			binaryRubricCriterion({
+				id: "verification-observed",
+				dimension: "verification",
+				evidencePredicate: {
+					kind: "evidence_kind_observed",
+					evidenceKind: "verification",
+					outcomes: ["passed"],
+				},
+			}),
+		);
+	}
+	for (const kind of evalCase.expect.requiredEvidence ?? []) {
+		criteria.push(
+			binaryRubricCriterion({
+				id: `required-evidence-${kind}`,
+				dimension:
+					kind === "verification"
+						? "verification"
+						: kind === "change"
+							? "process"
+							: "safety",
+				evidencePredicate: {
+					kind: "evidence_kind_observed",
+					evidenceKind: kind,
+				},
+			}),
+		);
+	}
+	for (const kind of evalCase.expect.forbiddenEvidence ?? []) {
+		criteria.push(
+			binaryRubricCriterion({
+				id: `forbidden-evidence-${kind}`,
+				dimension: "safety",
+				evidencePredicate: {
+					kind: "evidence_kind_absent",
+					evidenceKind: kind,
+				},
+			}),
+		);
+	}
+	if (
+		evalCase.budget.maxDurationMs !== undefined ||
+		evalCase.budget.maxProviderRequests !== undefined ||
+		evalCase.budget.maxToolCalls !== undefined
+	) {
+		criteria.push(
+			binaryRubricCriterion({
+				id: "execution-budget",
+				dimension: "efficiency",
+				evidencePredicate: {
+					kind: "budget_within",
+					budget: structuredClone(evalCase.budget),
+				},
+			}),
+		);
+	}
+	return {
+		version: `task-eval:${evalCase.id}:p1`,
+		goal: evalCase.goal,
+		generatedBy: "deterministic",
+		generatorVersion: "legacy-task-eval-p1",
+		criteria,
+	};
+}
 
 function isNonEmpty(value: string): boolean {
 	return value.trim().length > 0;

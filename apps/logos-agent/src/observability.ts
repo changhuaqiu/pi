@@ -38,7 +38,9 @@ export interface LogosAgentObservability {
 	runTurn(
 		input: string,
 		operation: () => Promise<LogosAgentTurnResult>,
+		context?: { executionId?: string },
 	): Promise<LogosAgentTurnResult>;
+	linkTaskRun(runId: string): void;
 	shutdown(): Promise<void>;
 }
 
@@ -113,6 +115,8 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 	private activeTurnSpan?: ObservabilitySpan;
 	private activeProviderSpan?: ObservabilitySpan;
 	private activeTurnTokens?: ProcessedTokenUsage;
+	private activeExecutionId?: string;
+	private activeRunId?: string;
 	private readonly toolSpans = new Map<string, ObservabilitySpan>();
 	private warningEmitted = false;
 
@@ -140,6 +144,12 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 						[SemanticConventions.LLM_PROVIDER]: event.model.provider,
 						[SemanticConventions.LLM_SYSTEM]: event.model.api,
 						[SemanticConventions.LLM_MODEL_NAME]: event.model.id,
+						...(this.activeExecutionId === undefined
+							? {}
+							: { "logos_agent.execution_id": this.activeExecutionId }),
+						...(this.activeRunId === undefined
+							? {}
+							: { "logos_agent.run_id": this.activeRunId }),
 					},
 				});
 				this.activeProviderSpan = span;
@@ -180,6 +190,12 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 							[SemanticConventions.OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.TOOL,
 							[SemanticConventions.TOOL_NAME]: event.toolName,
 							"logos_agent.tool_call_id": event.toolCallId,
+							...(this.activeExecutionId === undefined
+								? {}
+								: { "logos_agent.execution_id": this.activeExecutionId }),
+							...(this.activeRunId === undefined
+								? {}
+								: { "logos_agent.run_id": this.activeRunId }),
 							...(this.captureContent
 								? {
 									[SemanticConventions.INPUT_VALUE]: serializeObservabilityValue(
@@ -241,6 +257,7 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 	async runTurn(
 		input: string,
 		operation: () => Promise<LogosAgentTurnResult>,
+		context: { executionId?: string } = {},
 	): Promise<LogosAgentTurnResult> {
 		let operationPromise: Promise<LogosAgentTurnResult> | undefined;
 		let operationFailed = false;
@@ -251,6 +268,9 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 				{
 					attributes: {
 						[SemanticConventions.OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.AGENT,
+						...(context.executionId === undefined
+							? {}
+							: { "logos_agent.execution_id": context.executionId }),
 						...(this.captureContent
 							? {
 								[SemanticConventions.INPUT_VALUE]: bounded(
@@ -263,6 +283,7 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 				},
 				(span) => {
 					this.activeTurnSpan = span;
+					this.activeExecutionId = context.executionId;
 					this.activeTurnTokens = {
 						newInput: 0,
 						cacheRead: 0,
@@ -311,6 +332,10 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 								span.end();
 							});
 							if (this.activeTurnSpan === span) this.activeTurnSpan = undefined;
+							if (this.activeExecutionId === context.executionId) {
+								this.activeExecutionId = undefined;
+							}
+							this.activeRunId = undefined;
 							this.activeTurnTokens = undefined;
 						}
 					})();
@@ -325,8 +350,23 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 				return await operationPromise;
 			}
 			this.warn(error);
-			return await operation();
+			try {
+				return await operation();
+			} finally {
+				this.activeRunId = undefined;
+			}
 		}
+	}
+
+	linkTaskRun(runId: string): void {
+		this.activeRunId = runId;
+		this.observe(() => {
+			this.activeTurnSpan?.setAttribute("logos_agent.run_id", runId);
+			this.activeProviderSpan?.setAttribute("logos_agent.run_id", runId);
+			for (const span of this.toolSpans.values()) {
+				span.setAttribute("logos_agent.run_id", runId);
+			}
+		});
 	}
 
 	async shutdown(): Promise<void> {
@@ -443,7 +483,8 @@ class PhoenixLogosAgentObservability implements LogosAgentObservability {
 
 const disabledObservability: LogosAgentObservability = {
 	instrument: () => () => {},
-	runTurn: async (_input, operation) => await operation(),
+	runTurn: async (_input, operation, _context) => await operation(),
+	linkTaskRun: () => {},
 	shutdown: async () => {},
 };
 

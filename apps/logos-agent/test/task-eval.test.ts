@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	compareTaskEvalReports,
 	runTaskEvalSuite,
+	taskEvalCaseToRubricFreezeInput,
 	type TaskEvalCase,
 	type TaskEvalReport,
 	type TaskEvalSuite,
@@ -226,4 +227,36 @@ test("task eval comparison reports release regressions", () => {
 	assert.equal(comparison.deltaPassRate, -100);
 	assert.equal(comparison.deltaVerifiedRate, -100);
 	assert.equal(comparison.cases[0]?.change, "regressed");
+});
+
+test("legacy TaskEval cases migrate to frozen evidence-referenced rubric input", () => {
+	const input = taskEvalCaseToRubricFreezeInput(evalCase);
+
+	assert.equal(input.goal, evalCase.goal);
+	assert.equal(input.generatedBy, "deterministic");
+	assert.ok(
+		input.criteria.some(
+			(criterion) =>
+				criterion.evidencePredicate.kind === "current_subject_verified",
+		),
+	);
+	assert.ok(
+		input.criteria.some(
+			(criterion) =>
+				criterion.evidencePredicate.kind === "evidence_kind_observed" &&
+				criterion.evidencePredicate.evidenceKind === "change",
+		),
+	);
+	assert.ok(
+		input.criteria.some(
+			(criterion) =>
+				criterion.evidencePredicate.kind === "evidence_kind_absent" &&
+				criterion.evidencePredicate.evidenceKind === "policy_violation",
+		),
+	);
+	assert.ok(
+		input.criteria.some(
+			(criterion) => criterion.evidencePredicate.kind === "budget_within",
+		),
+	);
 });

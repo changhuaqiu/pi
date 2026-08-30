@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
-export const TASK_RUN_EVENT_VERSION = 1;
+export const TASK_RUN_EVENT_VERSION = 2;
+const LEGACY_TASK_RUN_EVENT_VERSION = 1;
 
 export type TaskRunStatus = "active" | "waiting" | "terminal";
 export type TaskRunPhase = "discover" | "execute" | "verify" | "deliver";
@@ -61,6 +63,8 @@ export interface TaskRunEvidence {
 	recordedAt: string;
 }
 
+export type TaskRunEvidenceInput = Omit<TaskRunEvidence, "id" | "recordedAt">;
+
 export interface TaskRunMetrics {
 	providerRequests: number;
 	toolCalls: number;
@@ -73,6 +77,7 @@ export interface TaskRunMetrics {
 
 export interface TaskRunState {
 	id: string;
+	executionId: string;
 	sessionId: string;
 	goal: string;
 	status: TaskRunStatus;
@@ -93,7 +98,7 @@ export interface TaskRunState {
 }
 
 interface TaskRunEventBase {
-	version: 1;
+	version: 2;
 	id: string;
 	runId: string;
 	sequence: number;
@@ -103,6 +108,7 @@ interface TaskRunEventBase {
 
 export interface TaskRunStartedEvent extends TaskRunEventBase {
 	type: "started";
+	executionId: string;
 	sessionId: string;
 	goal: string;
 	manifest: TaskRunManifest;
@@ -147,11 +153,12 @@ export type TaskRunUpdate =
 	| { type: "resume" }
 	| {
 			type: "evidence";
-			evidence: Omit<TaskRunEvidence, "id" | "recordedAt">;
+			evidence: TaskRunEvidenceInput;
 	  }
 	| { type: "finish"; conclusion: TaskRunConclusion; reason?: string };
 
 export interface TaskRunStartInput {
+	executionId: string;
 	sessionId: string;
 	goal: string;
 	manifest: TaskRunManifest;
@@ -278,7 +285,7 @@ function parseBudget(value: unknown): TaskRunBudget | undefined {
 	};
 }
 
-function parseManifest(value: unknown): TaskRunManifest {
+export function decodeTaskRunManifest(value: unknown): TaskRunManifest {
 	if (!isRecord(value) || !isRecord(value.model)) {
 		throw new TaskRunError("invalid_event", "TaskRun manifest is invalid");
 	}
@@ -316,7 +323,7 @@ function parseManifest(value: unknown): TaskRunManifest {
 	};
 }
 
-function parseEvidence(value: unknown): TaskRunEvidence {
+export function decodeTaskRunEvidence(value: unknown): TaskRunEvidence {
 	if (
 		!isRecord(value) ||
 		!isNonEmptyString(value.id) ||
@@ -347,7 +354,8 @@ function parseEvidence(value: unknown): TaskRunEvidence {
 export function decodeTaskRunEvent(value: unknown): TaskRunEvent {
 	if (
 		!isRecord(value) ||
-		value.version !== TASK_RUN_EVENT_VERSION ||
+		(value.version !== TASK_RUN_EVENT_VERSION &&
+			value.version !== LEGACY_TASK_RUN_EVENT_VERSION) ||
 		!isNonEmptyString(value.id) ||
 		!isNonEmptyString(value.runId) ||
 		!isPositiveInteger(value.sequence) ||
@@ -368,6 +376,8 @@ export function decodeTaskRunEvent(value: unknown): TaskRunEvent {
 	} as const;
 	if (value.type === "started") {
 		if (
+			(value.version === TASK_RUN_EVENT_VERSION &&
+				!isNonEmptyString(value.executionId)) ||
 			!isNonEmptyString(value.sessionId) ||
 			!isNonEmptyString(value.goal)
 		) {
@@ -376,9 +386,13 @@ export function decodeTaskRunEvent(value: unknown): TaskRunEvent {
 		return {
 			...base,
 			type: "started",
+			executionId:
+				value.version === LEGACY_TASK_RUN_EVENT_VERSION
+					? `legacy-task-run:${value.runId}`
+					: String(value.executionId),
 			sessionId: value.sessionId,
 			goal: value.goal,
-			manifest: parseManifest(value.manifest),
+			manifest: decodeTaskRunManifest(value.manifest),
 		};
 	}
 	if (value.type === "phase_changed" && isTaskRunPhase(value.phase)) {
@@ -392,7 +406,7 @@ export function decodeTaskRunEvent(value: unknown): TaskRunEvent {
 		return {
 			...base,
 			type: "evidence_recorded",
-			evidence: parseEvidence(value.evidence),
+			evidence: decodeTaskRunEvidence(value.evidence),
 		};
 	}
 	if (value.type === "finished" && isTaskRunConclusion(value.conclusion)) {
@@ -498,6 +512,7 @@ function evolveTaskRun(
 		}
 		return {
 			id: event.runId,
+			executionId: event.executionId,
 			sessionId: event.sessionId,
 			goal: event.goal,
 			status: "active",
@@ -610,13 +625,46 @@ export function reduceTaskRunEvents(
 }
 
 function validateStartInput(input: TaskRunStartInput): void {
+	if (!isNonEmptyString(input.executionId)) {
+		throw new TaskRunError("invalid_argument", "TaskRun executionId is required");
+	}
 	if (!isNonEmptyString(input.sessionId)) {
 		throw new TaskRunError("invalid_argument", "TaskRun sessionId is required");
 	}
 	if (!isNonEmptyString(input.goal)) {
 		throw new TaskRunError("invalid_argument", "TaskRun goal is required");
 	}
-	parseManifest(input.manifest);
+	decodeTaskRunManifest(input.manifest);
+}
+
+function startMatchesInput(
+	event: TaskRunStartedEvent,
+	input: TaskRunStartInput,
+): boolean {
+	return (
+		event.executionId === input.executionId &&
+		event.sessionId === input.sessionId &&
+		event.goal === input.goal.trim() &&
+		isDeepStrictEqual(event.manifest, input.manifest)
+	);
+}
+
+function eventMatchesUpdate(event: TaskRunEvent, update: TaskRunUpdate): boolean {
+	if (event.type === "phase_changed" && update.type === "phase") {
+		return event.phase === update.phase;
+	}
+	if (event.type === "waiting" && update.type === "wait") {
+		return event.reason === update.reason;
+	}
+	if (event.type === "resumed" && update.type === "resume") return true;
+	if (event.type === "evidence_recorded" && update.type === "evidence") {
+		const { id: _id, recordedAt: _recordedAt, ...evidence } = event.evidence;
+		return isDeepStrictEqual(evidence, update.evidence);
+	}
+	if (event.type === "finished" && update.type === "finish") {
+		return event.conclusion === update.conclusion && event.reason === update.reason;
+	}
+	return false;
 }
 
 function taskRunEvents(
@@ -645,12 +693,20 @@ export class TaskRunController {
 		return await this.serialized(async () => {
 			const existing = input.idempotencyKey
 				? (await this.journal.read()).find(
-						(event) =>
+						(event): event is TaskRunStartedEvent =>
 							event.type === "started" &&
 							event.idempotencyKey === input.idempotencyKey,
 					)
 				: undefined;
-			if (existing) return await this.get(existing.runId);
+			if (existing) {
+				if (!startMatchesInput(existing, input)) {
+					throw new TaskRunError(
+						"invalid_event",
+						`TaskRun idempotency key reused with different start input: ${input.idempotencyKey}`,
+					);
+				}
+				return await this.get(existing.runId);
+			}
 			const runId = this.createId();
 			const event: TaskRunStartedEvent = {
 				version: TASK_RUN_EVENT_VERSION,
@@ -662,6 +718,7 @@ export class TaskRunController {
 					? {}
 					: { idempotencyKey: input.idempotencyKey }),
 				type: "started",
+				executionId: input.executionId,
 				sessionId: input.sessionId,
 				goal: input.goal.trim(),
 				manifest: structuredClone(input.manifest),
@@ -687,7 +744,15 @@ export class TaskRunController {
 				const duplicate = events.find(
 					(event) => event.idempotencyKey === options.idempotencyKey,
 				);
-				if (duplicate) return reduceTaskRunEvents(events);
+				if (duplicate) {
+					if (!eventMatchesUpdate(duplicate, update)) {
+						throw new TaskRunError(
+							"invalid_event",
+							`TaskRun idempotency key reused with different update: ${options.idempotencyKey}`,
+						);
+					}
+					return reduceTaskRunEvents(events);
+				}
 			}
 			const state = reduceTaskRunEvents(events);
 			const base = {
@@ -732,9 +797,16 @@ export class TaskRunController {
 	}
 
 	async get(runId: string): Promise<TaskRunState> {
-		const events = taskRunEvents(await this.journal.read(), runId);
+		const events = await this.getEvents(runId);
 		if (events.length === 0) throw new TaskRunError("not_found", `TaskRun not found: ${runId}`);
 		return reduceTaskRunEvents(events);
+	}
+
+	async getEvents(runId: string): Promise<readonly TaskRunEvent[]> {
+		if (!isNonEmptyString(runId)) {
+			throw new TaskRunError("invalid_argument", "TaskRun id is required");
+		}
+		return taskRunEvents(await this.journal.read(), runId);
 	}
 
 	async list(): Promise<TaskRunState[]> {
